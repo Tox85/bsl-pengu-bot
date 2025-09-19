@@ -1,0 +1,46 @@
+{
+  "name": "abs-bridge-swap-lp-bot",
+  "version": "1.0.0",
+  "description": "Bot TypeScript pour automatiser Bridge (Base→Abstract) → Swap (Pandora/Uniswap v3) → LP concentrée → Collect fees",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "commander": "^11.1.0",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.8.1",
+    "pino": "^8.17.2",
+    "pino-pretty": "^13.1.1",
+    "sql.js": "^1.8.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.4",
+    "@types/sql.js": "^1.4.0",
+    "@typescript-eslint/eslint-plugin": "^6.14.0",
+    "@typescript-eslint/parser": "^6.14.0",
+    "eslint": "^8.55.0",
+    "tsup": "^8.0.1",
+    "typescript": "^5.3.3",
+    "vitest": "^1.0.4"
+  },
+  "keywords": [
+    "abstract",
+    "uniswap-v3",
+    "defi",
+    "bridge",
+    "liquidity",
+    "typescript"
+  ],
+  "author": "ABS Bot Developer",
+  "license": "MIT"
+}
