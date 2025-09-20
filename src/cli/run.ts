@@ -6,11 +6,13 @@ dotenv.config();
 
 import { Command } from 'commander';
 import { ethers } from 'ethers';
-import { orchestratorService } from '../orchestrator/index.js';
+import { orchestratorService, OrchestratorService } from '../orchestrator/index.js';
 import { CONSTANTS } from '../config/env.js';
 import { logger } from '../core/logger.js';
 import { parseAmount, formatAmount } from '../core/math.js';
-import { toBool } from '../core/context.js';
+import { toBool, buildContext } from '../core/context.js';
+import { createSigner } from '../core/rpc.js';
+import { asLowerHexAddress } from '../core/normalizer.js';
 import { liquidityPositionService } from '../lp/index.js';
 import { tokenService } from '../services/token.js';
 import { stateManager } from '../orchestrator/state.js';
@@ -32,6 +34,7 @@ program
   .requiredOption('--swapPair <pair>', 'Paire de swap (PENGU/ETH|PENGU/USDC)')
   .requiredOption('--lpRange <percent>', 'Range LP en pourcentage')
   .requiredOption('--collectAfter <minutes>', 'Minutes avant collecte des frais')
+  .option('--collectAfterBlocks <blocks>', 'Attendre X blocs avant collect (alternative à minutes)', '0')
   .option('--dry-run [value]', 'Mode simulation (pas de transaction réelle)', 'true')
   .option('--fresh', 'Démarrer avec un état propre (ignore .state)', false)
   .option('--autoGasTopUp [value]', 'Auto top-up du gas natif sur Abstract', 'true')
@@ -41,6 +44,7 @@ program
   .option('--router <address>', 'Adresse du router V3 (override)')
   .option('--npm <address>', 'Adresse du NonfungiblePositionManager (override)')
   .option('--factory <address>', 'Adresse de la factory (override)')
+  .option('--debug-events', 'Afficher les logs d\'events détaillés', false)
   .action(async (options) => {
     try {
       logger.info({
@@ -58,7 +62,7 @@ program
       if (options.fresh) {
         const fs = await import('fs');
         try {
-          await fs.promises.rmdir('.state', { recursive: true });
+          await fs.promises.rm('.state', { recursive: true, force: true });
           logger.info({ message: 'État nettoyé (--fresh)' });
         } catch (error) {
           // Ignorer si le dossier n'existe pas
@@ -78,7 +82,7 @@ program
         bridgeToken: options.bridgeToken as 'ETH' | 'USDC',
         swapAmount: options.swapAmount,
         swapPair: options.swapPair as 'PENGU/ETH' | 'PENGU/USDC',
-        lpRangePercent: parseFloat(options.lpRange),
+        lpRangePercent: options.lpRange,
         collectAfterMinutes: parseInt(options.collectAfter),
         dryRun: toBool(options.dryRun),
         // Passer les options de gas directement
@@ -132,10 +136,19 @@ program
           console.log(`  Frais collectés: ${result.metrics.totalFeesCollected.amount0.toString()} ${result.metrics.totalFeesCollected.token0} + ${result.metrics.totalFeesCollected.amount1.toString()} ${result.metrics.totalFeesCollected.token1}`);
         }
       } else {
-        console.log('\n❌ Flow échoué:');
-        console.log(`  Erreur: ${result.error}`);
-        console.log(`  Étape: ${result.state.currentStep}`);
-        process.exit(1);
+        // Vérifier si c'est un succès (collect_skipped, collect_executed, collect_done)
+        const SUCCESS_STEPS = new Set(['collect_executed', 'collect_skipped', 'collect_done']);
+        const isSuccess = SUCCESS_STEPS.has(result.state.currentStep);
+        
+        if (isSuccess) {
+          console.log('\n🎉 Flow complet exécuté avec succès!');
+          console.log(`  Étape finale: ${result.state.currentStep}`);
+        } else {
+          console.log('\n❌ Flow échoué:');
+          console.log(`  Erreur: ${result.error || 'Inconnue'}`);
+          console.log(`  Étape: ${result.state.currentStep}`);
+          process.exit(1);
+        }
       }
 
     } catch (error) {
@@ -406,6 +419,218 @@ program
       logger.error({
         error: error instanceof Error ? error.message : 'Unknown error',
         message: 'Erreur lors de la liste des états'
+      });
+      process.exit(1);
+    }
+  });
+
+// Commande swap-only
+program
+  .command('swap-only')
+  .description('Exécuter uniquement l\'étape de swap')
+  .option('--swapAmount <amount>', 'Montant à swapper', '0.001')
+  .option('--swapPair <pair>', 'Paire de tokens (PENGU/USDC)', 'PENGU/USDC')
+  .option('--swapEngine <engine>', 'Moteur de swap (v3|lifi|auto)', 'v3')
+  .option('--autoGasTopUp <enabled>', 'Auto top-up gas', 'false')
+  .option('--dry-run <enabled>', 'Mode simulation', 'false')
+  .option('--debug-events', 'Afficher les logs d\'events détaillés', false)
+  .action(async (options) => {
+    try {
+      // Vérifier que la clé privée existe
+      const privateKey = process.env.PRIVATE_KEY || '0x1234567890123456789012345678901234567890123456789012345678901234';
+      if (!privateKey.startsWith('0x') || privateKey.length !== 66) {
+        throw new Error('PRIVATE_KEY invalide: doit commencer par 0x et faire 66 caractères');
+      }
+
+      const context = buildContext({
+        dryRun: toBool(options.dryRun),
+        autoGasTopUp: toBool(options.autoGasTopUp),
+        fresh: false,
+        swapEngine: options.swapEngine,
+        routerOverride: undefined,
+        npmOverride: undefined,
+        factoryOverride: undefined,
+        privateKey: privateKey,
+      });
+
+      const orchestrator = new OrchestratorService();
+      
+      // Créer un état initial
+      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const walletAddress = await signer.getAddress();
+      const initialState = {
+        wallet: asLowerHexAddress(walletAddress),
+        currentStep: 'swap_pending' as const,
+        bridgeResult: null,
+        swapResult: null,
+        positionResult: null,
+        collectResult: null,
+        metrics: {
+          startTime: Date.now(),
+          endTime: 0,
+          totalDuration: 0,
+          feesCollected: { token0: '0', token1: '0' }
+        }
+      };
+
+      // Exécuter uniquement le swap
+      const result = await orchestrator.executeSwapStep(initialState, {
+        wallet: walletAddress,
+        swapAmount: options.swapAmount,
+        swapPair: options.swapPair,
+        swapEngine: options.swapEngine,
+        privateKey: privateKey,
+        bridgeAmount: 0,
+        bridgeToken: 'USDC',
+        lpRangePercent: 5,
+        collectAfterMinutes: 0,
+        autoGasTopUp: toBool(options.autoGasTopUp),
+        fresh: false,
+        gasTopUpTarget: 100000000000000,
+        routerOverride: undefined,
+        npmOverride: undefined,
+        factoryOverride: undefined,
+      }, context);
+
+      console.log('\n✅ Swap exécuté avec succès!');
+      console.log(`  TX Hash: ${result.swapResult?.txHash}`);
+      console.log(`  Montant: ${result.swapResult?.amountIn} → ${result.swapResult?.amountOut}`);
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors du swap'
+      });
+      process.exit(1);
+    }
+  });
+
+// Commande lp-only
+program
+  .command('lp-only')
+  .description('Exécuter uniquement l\'étape de création de position LP')
+  .option('--lpRange <percent>', 'Range de liquidité en pourcentage', '5')
+  .option('--swapPair <pair>', 'Paire de tokens (PENGU/USDC)', 'PENGU/USDC')
+  .option('--dry-run <enabled>', 'Mode simulation', 'false')
+  .option('--debug-events', 'Afficher les logs d\'events détaillés', false)
+  .action(async (options) => {
+    try {
+      // Vérifier que la clé privée existe
+      const privateKey = process.env.PRIVATE_KEY || '0x1234567890123456789012345678901234567890123456789012345678901234';
+      if (!privateKey.startsWith('0x') || privateKey.length !== 66) {
+        throw new Error('PRIVATE_KEY invalide: doit commencer par 0x et faire 66 caractères');
+      }
+
+      const context = buildContext({
+        dryRun: toBool(options.dryRun),
+        autoGasTopUp: false,
+        fresh: false,
+        swapEngine: 'v3',
+        routerOverride: undefined,
+        npmOverride: undefined,
+        factoryOverride: undefined,
+        privateKey: privateKey,
+      });
+
+      const orchestrator = new OrchestratorService();
+      
+      // Créer un état initial
+      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const walletAddress = await signer.getAddress();
+      const initialState = {
+        wallet: asLowerHexAddress(walletAddress),
+        currentStep: 'lp_pending' as const,
+        bridgeResult: null,
+        swapResult: null,
+        positionResult: null,
+        collectResult: null,
+        metrics: {
+          startTime: Date.now(),
+          endTime: 0,
+          totalDuration: 0,
+          feesCollected: { token0: '0', token1: '0' }
+        }
+      };
+
+      // Exécuter uniquement la création LP
+      const result = await orchestrator.executeLpStep(initialState, {
+        wallet: walletAddress,
+        lpRangePercent: options.lpRange,
+        swapPair: options.swapPair,
+        privateKey: privateKey,
+        bridgeAmount: 0,
+        bridgeToken: 'USDC',
+        swapAmount: 0.001,
+        swapEngine: 'v3',
+        collectAfterMinutes: 0,
+        autoGasTopUp: false,
+        fresh: false,
+        gasTopUpTarget: 100000000000000,
+        routerOverride: undefined,
+        npmOverride: undefined,
+        factoryOverride: undefined,
+      }, context, process.env.PRIVATE_KEY!);
+
+      console.log('\n✅ Position LP créée avec succès!');
+      console.log(`  TX Hash: ${result.positionResult?.txHash}`);
+      console.log(`  Token ID: ${result.positionResult?.tokenId}`);
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors de la création LP'
+      });
+      process.exit(1);
+    }
+  });
+
+// Commande collect-only
+program
+  .command('collect-only')
+  .description('Exécuter uniquement l\'étape de collecte des frais')
+  .requiredOption('--tokenId <id>', 'ID de la position LP')
+              .option('--recipient <address>', 'Adresse destinataire (défaut: wallet)')
+              .option('--max', 'Utiliser MAX_UINT128 par défaut', true)
+  .option('--debug-events', 'Afficher les logs d\'events détaillés', false)
+  .option('--dry-run <enabled>', 'Mode simulation', 'false')
+  .action(async (options) => {
+    try {
+      // Vérifier que la clé privée existe
+      const privateKey = process.env.PRIVATE_KEY || '0x1234567890123456789012345678901234567890123456789012345678901234';
+      if (!privateKey.startsWith('0x') || privateKey.length !== 66) {
+        throw new Error('PRIVATE_KEY invalide: doit commencer par 0x et faire 66 caractères');
+      }
+
+      // Construire les paramètres correctement
+      const walletAddress = (await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT)).getAddress();
+      const recipient = options.recipient || walletAddress;
+      const limits = options.max 
+        ? { amount0Max: 340282366920938463463374607431768211455n, amount1Max: 340282366920938463463374607431768211455n }
+        : { amount0Max: 1000000000000000000n, amount1Max: 1000000000000000000n };
+
+      // Exécuter directement la collecte
+      const result = await liquidityPositionService.collectFees({
+        tokenId: BigInt(options.tokenId),
+        recipient: recipient,
+        amount0Max: limits.amount0Max,
+        amount1Max: limits.amount1Max,
+      }, privateKey, {
+        dryRun: toBool(options.dryRun),
+      });
+
+      console.log('\n✅ Collecte des frais exécutée!');
+      console.log(`  Status: ${result.status}`);
+      console.log(`  Executed: ${result.executed}`);
+      console.log(`  Montant0: ${result.amount0.toString()}`);
+      console.log(`  Montant1: ${result.amount1.toString()}`);
+      if (result.txHash) {
+        console.log(`  TX Hash: ${result.txHash}`);
+      }
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors de la collecte'
       });
       process.exit(1);
     }

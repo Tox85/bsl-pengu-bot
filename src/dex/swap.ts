@@ -351,12 +351,6 @@ export class SwapService {
       }
 
       // Le swap a réussi
-      logger.info({
-        txHash: swapResult.txHash,
-        amountOut: swapResult.amountOut?.toString(),
-        gasUsed: swapResult.gasUsed?.toString(),
-        message: 'Swap exactInput exécuté avec succès'
-      });
 
       return {
         pool: quote.pool,

@@ -84,5 +84,38 @@ export const NONFUNGIBLE_POSITION_MANAGER_ABI = [
       {"name":"amount1Max","type":"uint128"}
     ]}],
     "outputs":[{"name":"amount0","type":"uint256"},{"name":"amount1","type":"uint256"}]
+  },
+
+  // event Collect
+  {
+    "type":"event","name":"Collect","anonymous":false,
+    "inputs":[
+      {"name":"tokenId","type":"uint256","indexed":true},
+      {"name":"recipient","type":"address","indexed":false},
+      {"name":"amount0","type":"uint256","indexed":false},
+      {"name":"amount1","type":"uint256","indexed":false}
+    ]
+  },
+
+  // event IncreaseLiquidity
+  {
+    "type":"event","name":"IncreaseLiquidity","anonymous":false,
+    "inputs":[
+      {"name":"tokenId","type":"uint256","indexed":true},
+      {"name":"liquidity","type":"uint128","indexed":false},
+      {"name":"amount0","type":"uint256","indexed":false},
+      {"name":"amount1","type":"uint256","indexed":false}
+    ]
+  },
+
+  // event DecreaseLiquidity
+  {
+    "type":"event","name":"DecreaseLiquidity","anonymous":false,
+    "inputs":[
+      {"name":"tokenId","type":"uint256","indexed":true},
+      {"name":"liquidity","type":"uint128","indexed":false},
+      {"name":"amount0","type":"uint256","indexed":false},
+      {"name":"amount1","type":"uint256","indexed":false}
+    ]
   }
 ] as const;

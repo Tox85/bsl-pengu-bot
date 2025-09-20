@@ -78,6 +78,7 @@ export interface BridgeResult {
   toAmount: string;
   status: string;
   success: boolean;
+  gasUsed?: string;
   error?: string;
 }
 
@@ -90,6 +91,7 @@ export interface SwapResult {
   amountOut: string;
   txHash: string;
   success: boolean;
+  gasUsed?: string;
   error?: string;
 }
 
@@ -105,5 +107,6 @@ export interface PositionResult {
   amount1: bigint;
   txHash: string;
   success: boolean;
+  gasUsed?: string;
   error?: string;
 }

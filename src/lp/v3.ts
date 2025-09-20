@@ -1,4 +1,4 @@
-import { ethers } from 'ethers';
+import { ethers, Interface, Log, ContractTransactionReceipt } from 'ethers';
 import { CONSTANTS } from '../config/env.js';
 import { logger, logError } from '../core/logger.js';
 import { withRetryRpc, withRetryTransaction } from '../core/retry.js';
@@ -11,6 +11,8 @@ import {
   Q128 
 } from '../core/math.js';
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, ERC20_MIN_ABI, UNIV3_FACTORY_ABI, UNIV3_POOL_ABI } from '../abis/index.js';
+import { MAX_UINT128 } from '../config/nums.js';
+import { CollectResult, CollectStatus } from '../core/collect-status.js';
 import type { 
   PositionInfo, 
   CreatePositionParams, 
@@ -22,6 +24,30 @@ import type {
   AmountParams,
   CalculationResult
 } from './types.js';
+
+// Helpers pour parsing des events
+const npmIface = new Interface(NONFUNGIBLE_POSITION_MANAGER_ABI);
+const COLLECT_TOPIC = npmIface.getEvent("Collect").topicHash;
+
+function parseCollectFromReceipt(
+  receipt: ContractTransactionReceipt,
+  npmAddress: string
+) {
+  const addr = npmAddress.toLowerCase();
+  for (const log of receipt.logs as Log[]) {
+    if (log.address.toLowerCase() !== addr) continue;
+    if (log.topics?.[0] !== COLLECT_TOPIC) continue;
+    // ethers v6: decodeEventLog(eventName, data, topics)
+    const decoded = npmIface.decodeEventLog("Collect", log.data, log.topics);
+    // Event Collect(uint256 tokenId, address recipient, uint256 amount0, uint256 amount1)
+    const tokenId = BigInt(decoded.tokenId);
+    const recipient = decoded.recipient as string;
+    const amount0 = BigInt(decoded.amount0);
+    const amount1 = BigInt(decoded.amount1);
+    return { tokenId, recipient, amount0, amount1 };
+  }
+  return null;
+}
 
 // Service de gestion des positions LP Uniswap v3
 export class LiquidityPositionService {
@@ -295,6 +321,7 @@ export class LiquidityPositionService {
         liquidity,
         txHash: receipt.hash,
         success: true,
+        gasUsed: receipt.gasUsed.toString(),
       };
 
     } catch (error) {
@@ -513,12 +540,12 @@ export class LiquidityPositionService {
     }
   }
 
-  // Collecter les frais d'une position
+  // Collecter les frais d'une position (version corrigée ethers v6)
   async collectFees(
     params: CollectFeesParams,
     privateKey: string,
     options: { dryRun?: boolean } = {}
-  ): Promise<PositionResult> {
+  ): Promise<CollectResult> {
     const { dryRun = false } = options;
 
     try {
@@ -540,35 +567,78 @@ export class LiquidityPositionService {
         });
 
         return {
-          success: true,
+          executed: false,
+          expected0: 0n,
+          expected1: 0n,
+          amount0: 0n,
+          amount1: 0n,
+          txHash: null,
+          gasUsed: undefined,
+          status: 'collect_skipped'
         };
       }
 
       // Créer le signer
       const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const pm = this.ensurePositionManager();
+      const to = params.recipient || await signer.getAddress();
 
-      // Préparer les paramètres de collecte
       const collectParams = {
         tokenId: params.tokenId,
-        recipient: params.recipient,
-        amount0Max: params.amount0Max,
-        amount1Max: params.amount1Max,
+        recipient: to,
+        amount0Max: MAX_UINT128,
+        amount1Max: MAX_UINT128,
       };
 
-      // Estimer le gas
-      const pm = this.ensurePositionManager();
-      const gasLimit = await pm.collect.estimateGas(collectParams, { value: 0n });
+      // 1) Simuler pour savoir s'il y a des frais à collecter
+      let expected0: bigint = 0n;
+      let expected1: bigint = 0n;
+      try {
+        // v6 simulation
+        const result = await pm.collect.staticCall(collectParams);
+        // Uniswap NPM retourne (uint256 amount0, uint256 amount1)
+        // ethers v6 retourne soit un tuple soit un objet nommé; normaliser vers BigInt
+        const a0 = (result?.[0] ?? (result?.amount0 as any) ?? 0n);
+        const a1 = (result?.[1] ?? (result?.amount1 as any) ?? 0n);
+        expected0 = BigInt(a0);
+        expected1 = BigInt(a1);
+      } catch (e) {
+        logger.warn({ 
+          tokenId: params.tokenId.toString(), 
+          err: String(e) 
+        }, "Collect.staticCall failed; will attempt tx anyway");
+      }
 
-      // Obtenir le gas price
-      const gasPrice = await getGasPrice(signer.provider! as any);
+      // 2) Si rien à collecter, sortir proprement (évite .toString sur undefined)
+      if (expected0 === 0n && expected1 === 0n) {
+        logger.info({
+          tokenId: params.tokenId.toString(),
+          expected0: expected0.toString(),
+          expected1: expected1.toString(),
+        }, "No fees to collect yet; skipping collect tx");
+        
+        logger.info({
+          tokenId: params.tokenId.toString(),
+          status: 'collect_skipped'
+        }, "Collect status: collect_skipped");
+        
+        return { 
+          executed: false,
+          expected0: 0n,
+          expected1: 0n,
+          amount0: 0n,
+          amount1: 0n,
+          txHash: null,
+          gasUsed: undefined,
+          status: 'collect_skipped'
+        };
+      }
 
-      // Exécuter la collecte de frais
-      const tx = await withRetryTransaction(async () => {
-        return await pm.collect(collectParams, {
-          value: 0n,
-          gasLimit,
-          gasPrice,
-        });
+      // 3) Estimer et envoyer la tx
+      const gas = await pm.collect.estimateGas(collectParams);
+      const tx = await pm.collect(collectParams, { 
+        gasLimit: gas + gas / 5n,
+        value: 0n
       });
 
       logger.info({
@@ -583,8 +653,15 @@ export class LiquidityPositionService {
         throw new Error('Transaction de collecte de frais échouée');
       }
 
-      // Extraire les montants du receipt
-      const { amount0, amount1 } = this.extractAmountsFromReceipt(receipt);
+      // 4) Parser l'event Collect du receipt (robuste) et fallback vers les valeurs attendues
+      const parsed = parseCollectFromReceipt(receipt, pm.target as string);
+      const amount0 = parsed?.amount0 ?? expected0 ?? 0n;
+      const amount1 = parsed?.amount1 ?? expected1 ?? 0n;
+
+      // Guard avant d'utiliser les montants décodés
+      if (parsed && (parsed.amount0 === undefined || parsed.amount1 === undefined)) {
+        logger.warn({ parsed }, "Parsed Collect missing amounts; falling back to staticCall values");
+      }
 
       logger.info({
         tokenId: params.tokenId.toString(),
@@ -594,19 +671,39 @@ export class LiquidityPositionService {
         message: 'Frais collectés avec succès'
       });
 
+      logger.info({
+        tokenId: params.tokenId.toString(),
+        status: 'collect_executed'
+      }, "Collect status: collect_executed");
+
       return {
+        executed: true,
+        expected0,
+        expected1,
         amount0,
         amount1,
         txHash: receipt.hash,
-        success: true,
+        gasUsed: receipt.gasUsed.toString(),
+        status: 'collect_executed'
       };
 
     } catch (error) {
       logError(error, { tokenId: params.tokenId.toString() });
       
+      logger.info({
+        tokenId: params.tokenId.toString(),
+        status: 'collect_failed'
+      }, "Collect status: collect_failed");
+      
       return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        executed: false,
+        expected0: 0n,
+        expected1: 0n,
+        amount0: 0n,
+        amount1: 0n,
+        txHash: null,
+        gasUsed: undefined,
+        status: 'collect_failed'
       };
     }
   }

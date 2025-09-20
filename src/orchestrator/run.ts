@@ -12,6 +12,8 @@ import { GasService } from '../services/gas.js';
 import { costsReporter } from '../services/costs.js';
 import { buildContext, type BotContext } from '../core/context.js';
 import { stateManager } from './state.js';
+import { MAX_UINT128 } from '../config/nums.js';
+import { CollectStatus } from '../core/collect-status.js';
 import type { 
   OrchestratorParams, 
   OrchestratorResult, 
@@ -284,7 +286,7 @@ export class OrchestratorService {
   }
 
   // Exécuter l'étape de swap
-  private async executeSwapStep(
+  public async executeSwapStep(
     state: OrchestratorState,
     params: OrchestratorParams,
     context: BotContext
@@ -388,6 +390,7 @@ export class OrchestratorService {
           amountOut: result.amountOut.toString(),
           txHash: result.txHash || '',
           success: true,
+          gasUsed: result.gasUsed?.toString(),
         },
       });
 
@@ -423,7 +426,7 @@ export class OrchestratorService {
   }
 
   // Exécuter l'étape de LP
-  private async executeLpStep(
+  public async executeLpStep(
     state: OrchestratorState,
     params: OrchestratorParams,
     context: BotContext,
@@ -584,6 +587,7 @@ export class OrchestratorService {
           amount1: result.amount1 || 0n,
           txHash: result.txHash || '',
           success: true,
+          gasUsed: result.gasUsed,
         },
       });
 
@@ -656,7 +660,7 @@ export class OrchestratorService {
   }
 
   // Exécuter l'étape de collect
-  private async executeCollectStep(
+  public async executeCollectStep(
     state: OrchestratorState,
     params: OrchestratorParams,
     context: BotContext
@@ -701,8 +705,8 @@ export class OrchestratorService {
       const collectParams = {
         tokenId: context.dryRun ? 0n : tokenId,
         recipient: state.wallet,
-        amount0Max: ethers.MaxUint128, // Collecter tous les frais
-        amount1Max: ethers.MaxUint128, // Collecter tous les frais
+        amount0Max: MAX_UINT128, // Collecter tous les frais
+        amount1Max: MAX_UINT128, // Collecter tous les frais
       };
 
       // Collecter les frais
@@ -710,13 +714,21 @@ export class OrchestratorService {
         dryRun: context.dryRun,
       });
 
-      if (!result.success) {
-        throw new Error(`Collecte des frais échouée: ${result.error}`);
+      // Mapper le statut de collecte
+      let collectStatus: CollectStatus;
+      if (result.status === 'collect_skipped') {
+        collectStatus = 'collect_skipped';
+      } else if (result.status === 'collect_executed') {
+        collectStatus = 'collect_executed';
+      } else {
+        collectStatus = 'collect_failed';
+        throw new Error(`Collecte des frais échouée: ${result.status}`);
       }
 
       // Mettre à jour l'état avec le résultat
+      const finalStep = collectStatus === 'collect_skipped' ? 'collect_skipped' : OrchestratorStep.COLLECT_DONE;
       state = this.stateManager.updateState(state, {
-        currentStep: OrchestratorStep.COLLECT_DONE,
+        currentStep: finalStep,
         collectResult: {
           tokenId,
           token0: state.positionResult?.token0 || '',
@@ -724,19 +736,21 @@ export class OrchestratorService {
           tickLower: state.positionResult?.tickLower || 0,
           tickUpper: state.positionResult?.tickUpper || 0,
           liquidity: 0n,
-          amount0: result.amount0 || 0n,
-          amount1: result.amount1 || 0n,
+          amount0: result.amount0,
+          amount1: result.amount1,
           txHash: result.txHash || '',
           success: true,
+          gasUsed: result.gasUsed,
         },
       });
 
       logger.info({
         wallet: state.wallet,
-        tokenId: tokenId.toString(),
-        amount0: result.amount0?.toString(),
-        amount1: result.amount1?.toString(),
+        tokenId: tokenId?.toString(),
+        amount0: result.amount0.toString(),
+        amount1: result.amount1.toString(),
         txHash: result.txHash,
+        status: collectStatus,
         message: 'Frais collectés avec succès'
       });
 

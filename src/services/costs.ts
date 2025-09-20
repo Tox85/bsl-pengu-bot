@@ -175,17 +175,38 @@ export class CostsReporter {
     }
   }
 
-  // Calculer le gas total utilisé (simplifié)
+  // Calculer le gas total utilisé depuis les résultats des étapes
   private calculateTotalGasUsed(state: OrchestratorState): bigint {
-    // En réalité, il faudrait parser les receipts des transactions
-    // Pour l'instant, on retourne 0
-    return 0n;
+    let totalGas = 0n;
+    
+    // Gas du bridge (si disponible)
+    if (state.bridgeResult?.gasUsed) {
+      totalGas += BigInt(state.bridgeResult.gasUsed);
+    }
+    
+    // Gas du swap (si disponible)
+    if (state.swapResult?.gasUsed) {
+      totalGas += BigInt(state.swapResult.gasUsed);
+    }
+    
+    // Gas du LP (si disponible)
+    if (state.positionResult?.gasUsed) {
+      totalGas += BigInt(state.positionResult.gasUsed);
+    }
+    
+    // Gas du collect (si disponible)
+    if (state.collectResult?.gasUsed) {
+      totalGas += BigInt(state.collectResult.gasUsed);
+    }
+    
+    return totalGas;
   }
 
-  // Calculer le coût total du gas (simplifié)
+  // Calculer le coût total du gas en ETH
   private calculateTotalGasCost(state: OrchestratorState): bigint {
-    // En réalité, il faudrait parser les receipts et calculer gasUsed * gasPrice
-    // Pour l'instant, on retourne 0
+    // Pour l'instant, on ne peut pas calculer le coût exact sans les gas prices
+    // On retourne 0 et on laisse l'affichage montrer "0.0 ETH"
+    // TODO: Implémenter le calcul avec effectiveGasPrice des receipts
     return 0n;
   }
 
@@ -218,19 +239,23 @@ export class CostsReporter {
     console.log(`  Gas total: ${metrics.total.totalGasUsed.toString()}`);
     console.log(`  Coût total: ${metrics.total.totalGasCost} ETH`);
 
-    // Résumé des étapes
+    // Résumé des étapes avec breakdown des coûts
     console.log(`\n📋 Étapes exécutées:`);
     if (state.bridgeResult?.success) {
-      console.log(`  ✅ Bridge: ${state.bridgeResult.txHash}`);
+      const bridgeGas = state.bridgeResult.gasUsed ? BigInt(state.bridgeResult.gasUsed) : 0n;
+      console.log(`  ✅ Bridge: ${state.bridgeResult.txHash} (Gas: ${bridgeGas.toString()})`);
     }
     if (state.swapResult?.success) {
-      console.log(`  ✅ Swap: ${state.swapResult.txHash}`);
+      const swapGas = state.swapResult.gasUsed ? BigInt(state.swapResult.gasUsed) : 0n;
+      console.log(`  ✅ Swap: ${state.swapResult.txHash} (Gas: ${swapGas.toString()})`);
     }
     if (state.positionResult?.success) {
-      console.log(`  ✅ LP: ${state.positionResult.txHash} (TokenID: ${state.positionResult.tokenId})`);
+      const lpGas = state.positionResult.gasUsed ? BigInt(state.positionResult.gasUsed) : 0n;
+      console.log(`  ✅ LP: ${state.positionResult.txHash} (TokenID: ${state.positionResult.tokenId}, Gas: ${lpGas.toString()})`);
     }
     if (state.collectResult?.success) {
-      console.log(`  ✅ Collect: ${state.collectResult.txHash}`);
+      const collectGas = state.collectResult.gasUsed ? BigInt(state.collectResult.gasUsed) : 0n;
+      console.log(`  ✅ Collect: ${state.collectResult.txHash} (Gas: ${collectGas.toString()})`);
     }
 
     console.log('═'.repeat(50));
