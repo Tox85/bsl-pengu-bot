@@ -9,6 +9,7 @@ import { bridgeService } from '../bridge/index.js';
 import { swapService } from '../dex/index.js';
 import { liquidityPositionService } from '../lp/index.js';
 import { GasService } from '../services/gas.js';
+import { costsReporter } from '../services/costs.js';
 import { buildContext, type BotContext } from '../core/context.js';
 import { stateManager } from './state.js';
 import type { 
@@ -37,26 +38,40 @@ export class OrchestratorService {
         privateKey: params.privateKey,
         autoGasTopUp: params.autoGasTopUp,
         fresh: false, // Géré par le CLI
-        dryRun: params.dryRun?.toString() || "false",
+        dryRun: params.dryRun,
         minNativeOnDest: params.minNativeOnDest,
         gasTopUpTarget: params.gasTopUpTarget,
+        routerOverride: params.routerOverride,
+        npmOverride: params.npmOverride,
+        factoryOverride: params.factoryOverride,
       });
 
       logger.info({
         wallet: context.walletAddress,
+        signer: context.walletAddress,
+        dryRun: context.dryRun,
         bridgeAmount: params.bridgeAmount,
         bridgeToken: params.bridgeToken,
         swapAmount: params.swapAmount,
         swapPair: params.swapPair,
         lpRangePercent: params.lpRangePercent,
         collectAfterMinutes: params.collectAfterMinutes,
-        dryRun: context.dryRun,
         autoGasTopUp: context.autoGasTopUp,
         message: 'Démarrage de l\'orchestrateur'
       });
 
+      // Log de debug pour vérifier le contexte
+      logger.info({
+        contextDryRun: context.dryRun,
+        paramsDryRun: params.dryRun,
+        message: 'DEBUG: Vérification du contexte dryRun'
+      });
+
       // Charger ou créer l'état
       let state = this.stateManager.loadState(context.walletAddress) || this.stateManager.createState(context.walletAddress);
+
+      // Initialiser le reporter de coûts
+      await costsReporter.initializeBalances(context.walletAddress);
 
       // Vérifier la connexion RPC
       await this.checkRpcConnections();
@@ -66,6 +81,9 @@ export class OrchestratorService {
 
       // Calculer les métriques
       const metrics = await this.calculateMetrics(state, startTime);
+
+      // Générer le rapport de coûts
+      await costsReporter.generateReport(context.walletAddress, state);
 
       // Sauvegarder l'état final
       this.stateManager.saveState(state);
@@ -113,7 +131,7 @@ export class OrchestratorService {
 
     // Étape 1: Bridge (si pas encore fait)
     if (currentState.currentStep === 'idle' || currentState.currentStep === 'bridge_pending') {
-      currentState = await this.executeBridgeStep(currentState, params);
+      currentState = await this.executeBridgeStep(currentState, params, context);
     }
 
     // Étape 2: Swap (si bridge terminé)
@@ -123,12 +141,12 @@ export class OrchestratorService {
 
     // Étape 3: LP (si swap terminé)
     if (currentState.currentStep === 'swap_done' || currentState.currentStep === 'lp_pending') {
-      currentState = await this.executeLpStep(currentState, params);
+      currentState = await this.executeLpStep(currentState, params, context, params.privateKey);
     }
 
     // Étape 4: Collect (si LP terminé)
     if (currentState.currentStep === 'lp_done' || currentState.currentStep === 'collect_pending') {
-      currentState = await this.executeCollectStep(currentState, params);
+      currentState = await this.executeCollectStep(currentState, params, context);
     }
 
     return currentState;
@@ -137,7 +155,8 @@ export class OrchestratorService {
   // Exécuter l'étape de bridge
   private async executeBridgeStep(
     state: OrchestratorState,
-    params: OrchestratorParams
+    params: OrchestratorParams,
+    context: BotContext
   ): Promise<OrchestratorState> {
     try {
       logger.info({
@@ -199,7 +218,7 @@ export class OrchestratorService {
 
       // Exécuter le bridge
       const result = await bridgeService.executeRoute(route, params.privateKey, {
-        dryRun: params.dryRun,
+        dryRun: context.dryRun,
       });
 
       if (!result.success) {
@@ -207,7 +226,7 @@ export class OrchestratorService {
       }
 
       // En mode réel, attendre que le bridge soit reçu sur Abstract
-      if (!params.dryRun && result.txHash) {
+      if (!context.dryRun && result.txHash) {
         logger.info({
           txHash: result.txHash,
           message: 'Attente confirmation bridge sur Abstract...'
@@ -298,7 +317,7 @@ export class OrchestratorService {
         message: 'Vérification solde Abstract'
       });
 
-      if (balance < requiredAmount + gasBuffer) {
+      if (!context.dryRun && balance < requiredAmount + gasBuffer) {
         throw new Error(`Solde insuffisant sur Abstract. Disponible: ${ethers.formatUnits(balance, decimals)}, Requis: ${ethers.formatUnits(requiredAmount + gasBuffer, decimals)}`);
       }
 
@@ -316,19 +335,23 @@ export class OrchestratorService {
         });
 
         // Re-vérifier le solde après top-up
-        const gasCheck = await GasService.checkNativeBalance(state.wallet, CONSTANTS.CHAIN_IDS.ABSTRACT);
-        if (!gasCheck.sufficient) {
-          throw new Error(`Solde gas natif insuffisant après top-up: ${gasCheck.balanceEth} ETH`);
+        if (!context.dryRun) {
+          const gasCheck = await GasService.checkNativeBalance(state.wallet, CONSTANTS.CHAIN_IDS.ABSTRACT);
+          if (!gasCheck.sufficient) {
+            throw new Error(`Solde gas natif insuffisant après top-up: ${gasCheck.balanceEth} ETH`);
+          }
         }
       } else {
         // Vérifier sans top-up automatique
-        const gasCheck = await GasService.checkNativeBalance(state.wallet, CONSTANTS.CHAIN_IDS.ABSTRACT);
-        if (!gasCheck.sufficient) {
-          throw new Error(
-            `Solde gas natif insuffisant sur Abstract: ${gasCheck.balanceEth} ETH. ` +
-            `Veuillez bridger ~${ethers.formatEther(targetWei)} ETH pour le gas ` +
-            `ou activez --autoGasTopUp true.`
-          );
+        if (!context.dryRun) {
+          const gasCheck = await GasService.checkNativeBalance(state.wallet, CONSTANTS.CHAIN_IDS.ABSTRACT);
+          if (!gasCheck.sufficient) {
+            throw new Error(
+              `Solde gas natif insuffisant sur Abstract: ${gasCheck.balanceEth} ETH. ` +
+              `Veuillez bridger ~${ethers.formatEther(targetWei)} ETH pour le gas ` +
+              `ou activez --autoGasTopUp true.`
+            );
+          }
         }
       }
 
@@ -343,7 +366,11 @@ export class OrchestratorService {
 
       // Exécuter le swap
       const result = await swapService.executeSwap(swapParams, params.privateKey, {
-        dryRun: params.dryRun,
+        dryRun: context.dryRun,
+        swapEngine: params.swapEngine,
+        routerOverride: context.routerOverride,
+        npmOverride: context.npmOverride,
+        factoryOverride: context.factoryOverride,
       });
 
       if (!result.success) {
@@ -398,7 +425,9 @@ export class OrchestratorService {
   // Exécuter l'étape de LP
   private async executeLpStep(
     state: OrchestratorState,
-    params: OrchestratorParams
+    params: OrchestratorParams,
+    context: BotContext,
+    privateKey: string
   ): Promise<OrchestratorState> {
     try {
       logger.info({
@@ -410,25 +439,112 @@ export class OrchestratorService {
       state = this.stateManager.updateState(state, { currentStep: OrchestratorStep.LP_PENDING });
 
       // Déterminer les tokens pour la position LP
-      const { token0, token1 } = this.getLpTokens(params.swapPair);
+      const { tokenA, tokenB } = this.getLpTokens(params.swapPair);
 
       // Obtenir les informations du pool
       const pool = await swapService.getQuote({
-        tokenIn: token0,
-        tokenOut: token1,
+        tokenIn: tokenA,
+        tokenOut: tokenB,
         amountIn: parseAmount('0.001', 18), // Montant minimal pour obtenir les infos du pool
       });
 
-      // Calculer le range de ticks
-      const { tickLower, tickUpper } = liquidityPositionService.calculateTickRange({
-        currentTick: pool.pool.tick,
-        tickSpacing: pool.pool.tickSpacing,
-        rangePercent: params.lpRangePercent,
+      // CORRECTION: Utiliser l'ordre du pool (token0 < token1 lexicographiquement)
+      const token0 = pool.pool.token0;
+      const token1 = pool.pool.token1;
+      const poolToken0 = token0;
+      const poolToken1 = token1;
+      
+      logger.info({
+        tokenA,
+        tokenB,
+        poolToken0: token0,
+        poolToken1: token1,
+        message: 'Ordre des tokens déterminé depuis le pool'
       });
 
-      // Calculer les montants pour la position
-      const amount0Desired = parseAmount('0.0005', 18); // Montant minimal
-      const amount1Desired = parseAmount('0.0005', 18); // Montant minimal
+      // CORRECTION: Calculer le range de ticks avec la bonne logique
+      const tickSpacing = pool.pool.tickSpacing;
+      const currentTick = pool.pool.tick;
+      
+      // Calculer le delta pour ±5% (ou le range spécifié)
+      const rangePercent = params.lpRangePercent / 100; // Convertir en décimal
+      const delta = Math.round(Math.log(1 + rangePercent) / Math.log(1.0001)); // ~487 pour 5%
+      
+      const rawLower = currentTick - delta;
+      const rawUpper = currentTick + delta;
+      const tickLower = Math.floor(rawLower / tickSpacing) * tickSpacing;
+      const tickUpper = Math.ceil(rawUpper / tickSpacing) * tickSpacing;
+
+      logger.info({
+        currentTick,
+        tickSpacing,
+        rangePercent: params.lpRangePercent,
+        delta,
+        tickLower,
+        tickUpper,
+        message: 'Range de ticks calculé'
+      });
+
+      // CORRECTION: Utiliser les balances réelles après le swap
+      const provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const signer = new ethers.Wallet(privateKey, provider);
+      
+      // Obtenir les décimales des tokens
+      const decimals0 = await this.getTokenDecimals(token0);
+      const decimals1 = await this.getTokenDecimals(token1);
+      
+      // Obtenir les balances réelles
+      const balance0 = await this.getTokenBalance(token0, state.wallet, signer);
+      const balance1 = await this.getTokenBalance(token1, state.wallet, signer);
+      
+      // Utiliser 50% de chaque balance disponible
+      const amount0Desired = balance0 / 2n;
+      const amount1Desired = balance1 / 2n;
+      
+      // Guard: éviter de mint avec des montants à 0
+      if (amount0Desired === 0n && amount1Desired === 0n) {
+        if (context.dryRun) {
+          logger.info({
+            token0: poolToken0,
+            token1: poolToken1,
+            fee: pool.pool.fee,
+            tickLower,
+            tickUpper,
+            message: 'DRY_RUN: Position LP simulée (montants à zéro)'
+          });
+          
+          // Simuler la création pour laisser la chaîne se poursuivre
+          state = this.stateManager.updateState(state, {
+            currentStep: OrchestratorStep.LP_DONE,
+            positionResult: {
+              tokenId: 0n,
+              txHash: '',
+              success: true
+            }
+          });
+          
+          return state;
+        }
+        
+        logger.warn({
+          message: 'Montants LP à zéro - skip mint',
+          balance0: balance0.toString(),
+          balance1: balance1.toString()
+        });
+        throw new Error('Impossible de créer une position LP: balances insuffisantes');
+      }
+      
+      logger.info({
+        token0,
+        token1,
+        decimals0,
+        decimals1,
+        balance0: balance0.toString(),
+        balance1: balance1.toString(),
+        amount0Desired: amount0Desired.toString(),
+        amount1Desired: amount1Desired.toString(),
+        message: 'Montants LP calculés depuis les balances réelles'
+      });
 
       // Préparer les paramètres de création de position
       const createParams = {
@@ -447,7 +563,7 @@ export class OrchestratorService {
 
       // Créer la position LP
       const result = await liquidityPositionService.createPosition(createParams, params.privateKey, {
-        dryRun: params.dryRun,
+        dryRun: context.dryRun,
       });
 
       if (!result.success) {
@@ -470,6 +586,17 @@ export class OrchestratorService {
           success: true,
         },
       });
+
+      // Sauvegarder les données de la position dans l'état
+      if (result.tokenId) {
+        stateManager.saveStepData('lp', {
+          tokenId: result.tokenId.toString(),
+          tickLower: tickLower.toString(),
+          tickUpper: tickUpper.toString(),
+          token0,
+          token1,
+        });
+      }
 
       logger.info({
         wallet: state.wallet,
@@ -507,10 +634,32 @@ export class OrchestratorService {
     }
   }
 
+  // Helper pour obtenir les décimales d'un token
+  private async getTokenDecimals(tokenAddress: string): Promise<number> {
+    if (/^0x0{40}$/i.test(tokenAddress)) return 18; // ETH natif
+    const provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+    const erc20 = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, provider);
+    return await erc20.decimals();
+  }
+
+  // Helper pour obtenir le solde d'un token
+  private async getTokenBalance(tokenAddress: string, owner: string, signer: ethers.Wallet): Promise<bigint> {
+    if (/^0x0{40}$/i.test(tokenAddress)) {
+      // ETH natif
+      return await signer.provider!.getBalance(owner);
+    }
+    
+    const token = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, signer);
+    return await withRetryRpc(async () => {
+      return await token.balanceOf(owner);
+    });
+  }
+
   // Exécuter l'étape de collect
   private async executeCollectStep(
     state: OrchestratorState,
-    params: OrchestratorParams
+    params: OrchestratorParams,
+    context: BotContext
   ): Promise<OrchestratorState> {
     try {
       logger.info({
@@ -522,7 +671,7 @@ export class OrchestratorService {
       state = this.stateManager.updateState(state, { currentStep: OrchestratorStep.COLLECT_PENDING });
 
       // Attendre le délai spécifié
-      if (!params.dryRun) {
+      if (!context.dryRun) {
         const waitTime = params.collectAfterMinutes * 60 * 1000; // Convertir en ms
         logger.info({
           wallet: state.wallet,
@@ -534,22 +683,31 @@ export class OrchestratorService {
       }
 
       // Obtenir le tokenId de la position
-      const tokenId = state.positionResult?.tokenId;
+      let tokenId = state.positionResult?.tokenId;
+      
+      // Si pas dans positionResult, essayer de le lire depuis les données sauvegardées
       if (!tokenId) {
-        throw new Error('TokenId de position non trouvé');
+        const lpData = stateManager.getStepData('lp');
+        if (lpData?.tokenId) {
+          tokenId = BigInt(lpData.tokenId);
+        }
+      }
+      
+      if (!context.dryRun && !tokenId) {
+        throw new Error('TokenId de position non trouvé dans l\'état. Assurez-vous qu\'une position LP a été créée.');
       }
 
       // Préparer les paramètres de collecte
       const collectParams = {
-        tokenId,
+        tokenId: context.dryRun ? 0n : tokenId,
         recipient: state.wallet,
-        amount0Max: ethers.MaxUint256, // Collecter tous les frais
-        amount1Max: ethers.MaxUint256, // Collecter tous les frais
+        amount0Max: ethers.MaxUint128, // Collecter tous les frais
+        amount1Max: ethers.MaxUint128, // Collecter tous les frais
       };
 
       // Collecter les frais
       const result = await liquidityPositionService.collectFees(collectParams, params.privateKey, {
-        dryRun: params.dryRun,
+        dryRun: context.dryRun,
       });
 
       if (!result.success) {
@@ -608,7 +766,7 @@ export class OrchestratorService {
 
   // Obtenir l'adresse du wallet
   private async getWalletAddress(privateKey: string): Promise<string> {
-    const signer = createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+    const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
     return await signer.getAddress();
   }
 
@@ -683,17 +841,17 @@ export class OrchestratorService {
   }
 
   // Obtenir les tokens pour la position LP
-  private getLpTokens(swapPair: 'PENGU/ETH' | 'PENGU/USDC'): { token0: string; token1: string } {
+  private getLpTokens(swapPair: 'PENGU/ETH' | 'PENGU/USDC'): { tokenA: string; tokenB: string } {
     if (swapPair === 'PENGU/ETH') {
       // Corriger : utiliser WETH au lieu d'ETH natif pour les pools v3
       return {
-        token0: CONSTANTS.TOKENS.PENGU,
-        token1: CONSTANTS.TOKENS.WETH,
+        tokenA: CONSTANTS.TOKENS.PENGU,
+        tokenB: CONSTANTS.TOKENS.WETH,
       };
     } else {
       return {
-        token0: CONSTANTS.TOKENS.PENGU,
-        token1: CONSTANTS.TOKENS.USDC,
+        tokenA: CONSTANTS.TOKENS.PENGU,
+        tokenB: CONSTANTS.TOKENS.USDC,
       };
     }
   }

@@ -1,8 +1,14 @@
 import { z } from 'zod';
-import { config } from 'dotenv';
 
 // Charger les variables d'environnement
-config();
+import dotenv from 'dotenv';
+dotenv.config();
+
+// Vérifier que les variables sont chargées
+if (!process.env.UNIV3_FACTORY) {
+  console.error('ERREUR: UNIV3_FACTORY non chargé depuis .env');
+  process.exit(1);
+}
 
 // Schéma de validation pour les adresses Ethereum
 const addressSchema = z.string().regex(/^0x[a-fA-F0-9]{40}$/, 'Adresse Ethereum invalide');

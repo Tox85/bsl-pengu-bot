@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 
+// Charger les variables d'environnement en premier
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { Command } from 'commander';
+import { ethers } from 'ethers';
 import { orchestratorService } from '../orchestrator/index.js';
 import { CONSTANTS } from '../config/env.js';
 import { logger } from '../core/logger.js';
 import { parseAmount, formatAmount } from '../core/math.js';
+import { toBool } from '../core/context.js';
+import { liquidityPositionService } from '../lp/index.js';
+import { tokenService } from '../services/token.js';
+import { stateManager } from '../orchestrator/state.js';
 
 const program = new Command();
 
@@ -16,7 +25,7 @@ program
 program
   .command('full')
   .description('Exécuter le flow complet')
-  .requiredOption('--privateKey <key>', 'Clé privée du wallet')
+  .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
   .requiredOption('--bridgeAmount <amount>', 'Montant à bridger')
   .requiredOption('--bridgeToken <token>', 'Token de bridge (ETH|USDC)')
   .requiredOption('--swapAmount <amount>', 'Montant à swapper')
@@ -28,6 +37,10 @@ program
   .option('--autoGasTopUp [value]', 'Auto top-up du gas natif sur Abstract', 'true')
   .option('--minNativeOnDest <wei>', 'Montant minimum gas natif sur destination (wei)')
   .option('--gasTopUpTarget <wei>', 'Montant cible pour le top-up gas (wei)')
+  .option('--swapEngine <engine>', 'Moteur de swap (v3|lifi|auto)', 'v3')
+  .option('--router <address>', 'Adresse du router V3 (override)')
+  .option('--npm <address>', 'Adresse du NonfungiblePositionManager (override)')
+  .option('--factory <address>', 'Adresse de la factory (override)')
   .action(async (options) => {
     try {
       logger.info({
@@ -52,21 +65,30 @@ program
         }
       }
 
-      // Les options CLI ont priorité sur les constantes
+      // Utiliser la clé privée du .env si pas fournie en paramètre
+      const privateKey = options.privateKey || process.env.PRIVATE_KEY;
+      if (!privateKey) {
+        throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
+      }
 
+      // Les options CLI ont priorité sur les constantes
       const params = {
-        privateKey: options.privateKey,
+        privateKey,
         bridgeAmount: options.bridgeAmount,
         bridgeToken: options.bridgeToken as 'ETH' | 'USDC',
         swapAmount: options.swapAmount,
         swapPair: options.swapPair as 'PENGU/ETH' | 'PENGU/USDC',
         lpRangePercent: parseFloat(options.lpRange),
         collectAfterMinutes: parseInt(options.collectAfter),
-        dryRun: options.dryRun === 'false' ? 'false' : 'true',
+        dryRun: toBool(options.dryRun),
         // Passer les options de gas directement
-        autoGasTopUp: options.autoGasTopUp === 'true' || options.autoGasTopUp === true,
+        autoGasTopUp: toBool(options.autoGasTopUp),
         minNativeOnDest: options.minNativeOnDest,
         gasTopUpTarget: options.gasTopUpTarget,
+        swapEngine: options.swapEngine,
+        routerOverride: options.router,
+        npmOverride: options.npm,
+        factoryOverride: options.factory,
       };
 
       const result = await orchestratorService.run(params);
@@ -128,16 +150,22 @@ program
 program
   .command('status')
   .description('Vérifier le statut de l\'orchestrateur')
-  .requiredOption('--privateKey <key>', 'Clé privée du wallet')
+  .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
   .action(async (options) => {
     try {
       logger.info({
         message: 'Vérification du statut de l\'orchestrateur'
       });
 
+      // Utiliser la clé privée du .env si pas fournie en paramètre
+      const privateKey = options.privateKey || process.env.PRIVATE_KEY;
+      if (!privateKey) {
+        throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
+      }
+
       // Obtenir l'adresse du wallet
       const { createSigner } = await import('../core/rpc.js');
-      const signer = createSigner(options.privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
       const wallet = await signer.getAddress();
 
       // Charger l'état
@@ -225,7 +253,7 @@ program
 
       // Obtenir l'adresse du wallet
       const { createSigner } = await import('../core/rpc.js');
-      const signer = createSigner(options.privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const signer = await createSigner(options.privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
       const wallet = await signer.getAddress();
 
       // Supprimer l'état
@@ -244,6 +272,116 @@ program
   });
 
 program
+  .command('collect')
+  .description('Collecter les frais d\'une position LP')
+  .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
+  .option('--tokenId <id>', 'Token ID de la position (si non fourni, lit depuis .state)')
+  .action(async (options) => {
+    try {
+      logger.info({
+        message: 'Collecte des frais LP'
+      });
+
+      // Utiliser la clé privée du .env si pas fournie en paramètre
+      const privateKey = options.privateKey || process.env.PRIVATE_KEY;
+      if (!privateKey) {
+        throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
+      }
+
+      // Obtenir l'adresse du wallet
+      const { createSigner } = await import('../core/rpc.js');
+      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const wallet = await signer.getAddress();
+
+      // Obtenir le tokenId
+      let tokenId: bigint;
+      if (options.tokenId) {
+        tokenId = BigInt(options.tokenId);
+      } else {
+        // Lire depuis l'état
+        const state = stateManager.loadState(wallet);
+        if (!state || !state.positionResult?.tokenId) {
+          console.log('\n❌ Aucune position LP trouvée dans l\'état. Utilisez --tokenId pour spécifier manuellement.');
+          return;
+        }
+        tokenId = state.positionResult.tokenId;
+      }
+
+      // Préparer les paramètres de collecte
+      const collectParams = {
+        tokenId,
+        recipient: wallet,
+        amount0Max: ethers.MaxUint256,
+        amount1Max: ethers.MaxUint256,
+      };
+
+      // Collecter les frais
+      const result = await liquidityPositionService.collectFees(collectParams, privateKey, {
+        dryRun: false,
+      });
+
+      if (result.success) {
+        console.log('\n✅ Frais collectés avec succès!');
+        console.log(`  TX Hash: ${result.txHash}`);
+        console.log(`  Montant0: ${result.amount0?.toString() || '0'}`);
+        console.log(`  Montant1: ${result.amount1?.toString() || '0'}`);
+      } else {
+        console.log('\n❌ Échec de la collecte des frais:');
+        console.log(`  Erreur: ${result.error}`);
+        process.exit(1);
+      }
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors de la collecte des frais'
+      });
+      process.exit(1);
+    }
+  });
+
+program
+  .command('unwrap-weth')
+  .description('Unwrap WETH vers ETH natif')
+  .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
+  .requiredOption('--amount <amount>', 'Montant WETH à unwrap (en ETH)')
+  .action(async (options) => {
+    try {
+      logger.info({
+        amount: options.amount,
+        message: 'Unwrap WETH vers ETH natif'
+      });
+
+      // Utiliser la clé privée du .env si pas fournie en paramètre
+      const privateKey = options.privateKey || process.env.PRIVATE_KEY;
+      if (!privateKey) {
+        throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
+      }
+
+      const result = await tokenService.unwrapWETH(options.amount, privateKey, {
+        dryRun: false,
+      });
+
+      if (result.success) {
+        console.log('\n✅ WETH unwrap exécuté avec succès!');
+        console.log(`  TX Hash: ${result.txHash}`);
+        console.log(`  Montant: ${options.amount} WETH → ETH`);
+      } else {
+        console.log('\n❌ Échec de l\'unwrap WETH:');
+        console.log(`  Erreur: ${result.error}`);
+        process.exit(1);
+      }
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors de l\'unwrap WETH'
+      });
+      process.exit(1);
+    }
+  });
+
+program
   .command('list')
   .description('Lister tous les états de l\'orchestrateur')
   .action(async () => {
@@ -252,7 +390,6 @@ program
         message: 'Liste des états de l\'orchestrateur'
       });
 
-      const { stateManager } = await import('../orchestrator/state.js');
       const states = stateManager.listStates();
 
       if (states.length === 0) {

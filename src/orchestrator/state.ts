@@ -167,6 +167,46 @@ export class StateManager {
   getStateFilePath(wallet: string): string {
     return join(this.stateDir, `orchestrator-${wallet.toLowerCase()}.json`);
   }
+
+  // Sauvegarder des données d'étape spécifiques
+  saveStepData(step: string, data: any): void {
+    try {
+      const stepDataFile = join(this.stateDir, `step-${step}.json`);
+      const stepData = JSON.stringify(data, (key, value) => {
+        if (typeof value === 'bigint') {
+          return value.toString();
+        }
+        return value;
+      }, 2);
+      
+      writeFileSync(stepDataFile, stepData, 'utf8');
+      
+      logger.debug({
+        step,
+        data,
+        message: 'Données d\'étape sauvegardées'
+      });
+    } catch (error) {
+      logError(error, { step });
+    }
+  }
+
+  // Charger des données d'étape spécifiques
+  getStepData(step: string): any | null {
+    try {
+      const stepDataFile = join(this.stateDir, `step-${step}.json`);
+      
+      if (!existsSync(stepDataFile)) {
+        return null;
+      }
+      
+      const stepData = readFileSync(stepDataFile, 'utf8');
+      return JSON.parse(stepData);
+    } catch (error) {
+      logError(error, { step });
+      return null;
+    }
+  }
 }
 
 // Instance singleton du gestionnaire d'état

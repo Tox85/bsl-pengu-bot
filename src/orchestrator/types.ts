@@ -38,6 +38,12 @@ export interface OrchestratorParams {
   autoGasTopUp?: boolean;
   minNativeOnDest?: string;
   gasTopUpTarget?: string;
+  // Options de swap
+  swapEngine?: 'v3' | 'lifi' | 'auto';
+  // Overrides d'adresses
+  routerOverride?: string;
+  npmOverride?: string;
+  factoryOverride?: string;
 }
 
 // Types pour les résultats de l'orchestrateur

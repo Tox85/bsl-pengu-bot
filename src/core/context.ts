@@ -6,6 +6,15 @@ import { ethers } from 'ethers';
 import { CONSTANTS } from '../config/env.js';
 import { getProvider } from './rpc.js';
 
+// Helper pour convertir les valeurs en booléen
+export function toBool(value: any): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    return value.toLowerCase() === 'true';
+  }
+  return Boolean(value);
+}
+
 export interface BotContext {
   // Providers
   providerBase: ethers.JsonRpcProvider;
@@ -27,6 +36,11 @@ export interface BotContext {
   // Gas settings
   minNativeOnDest?: string;
   gasTopUpTarget?: string;
+  
+  // Overrides d'adresses
+  routerOverride?: string;
+  npmOverride?: string;
+  factoryOverride?: string;
 }
 
 export function buildContext(params: {
@@ -36,6 +50,9 @@ export function buildContext(params: {
   dryRun?: boolean;
   minNativeOnDest?: string;
   gasTopUpTarget?: string;
+  routerOverride?: string;
+  npmOverride?: string;
+  factoryOverride?: string;
 }): BotContext {
   // Validation de la clé privée
   if (!params.privateKey.startsWith('0x') || params.privateKey.length !== 66) {
@@ -58,10 +75,13 @@ export function buildContext(params: {
     signerAbstract,
     walletAddress: wallet.address,
     privateKey: params.privateKey,
-    autoGasTopUp: params.autoGasTopUp !== undefined ? params.autoGasTopUp : CONSTANTS.AUTO_GAS_TOPUP,
-    fresh: params.fresh !== undefined ? params.fresh : false,
-    dryRun: params.dryRun !== undefined ? params.dryRun : CONSTANTS.DRY_RUN,
+    autoGasTopUp: params.autoGasTopUp !== undefined ? toBool(params.autoGasTopUp) : CONSTANTS.AUTO_GAS_TOPUP,
+    fresh: params.fresh !== undefined ? toBool(params.fresh) : false,
+    dryRun: params.dryRun !== undefined ? toBool(params.dryRun) : CONSTANTS.DRY_RUN,
     minNativeOnDest: params.minNativeOnDest,
     gasTopUpTarget: params.gasTopUpTarget,
+    routerOverride: params.routerOverride,
+    npmOverride: params.npmOverride,
+    factoryOverride: params.factoryOverride,
   };
 }

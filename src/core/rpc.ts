@@ -19,14 +19,18 @@ export const getProvider = (chainId: number): ethers.JsonRpcProvider => {
 };
 
 // Fonction utilitaire pour créer un signer
-export const createSigner = (privateKey: string, chainId: number): ethers.Wallet => {
+export const createSigner = async (privateKey: string, chainId: number): Promise<ethers.Wallet> => {
   const provider = getProvider(chainId);
   const wallet = new ethers.Wallet(privateKey, provider);
   
+  // Obtenir le chainId du réseau
+  const network = await provider.getNetwork();
+  
+  // Log obligatoire au démarrage
   logger.info({
-    chainId,
-    address: wallet.address,
-    message: 'Signer créé'
+    chainId: Number(network.chainId),
+    signer: wallet.address,
+    message: 'Signer prêt'
   });
   
   return wallet;

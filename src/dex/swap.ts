@@ -7,6 +7,10 @@ import { calculateMinAmountOut, calculatePriceImpact, isPriceImpactAcceptable } 
 import { QUOTER_V2_ABI, SWAP_ROUTER_02_ABI, ERC20_MIN_ABI } from '../abis/index.js';
 import { UNISWAP_V3_QUOTER_V2_ABI } from './univ3.js';
 import { poolDiscoveryService } from './pools.js';
+import { PERMIT2_ABI, PERMIT2_ADDRESS, MAX_UINT160, ONE_YEAR } from '../abi/permit2.js';
+import { SWAP_ROUTER_02_ABI, SWAP_ROUTER_02_ADDRESS } from '../abi/swap-router-02.js';
+import { lifiSwapService, type LiFiSwapParams } from '../services/lifi-swap.js';
+import { factoryChecker } from '../services/factory-checker.js';
 import type { SwapParams, SwapResult, QuoteParams, QuoteResult } from './types.js';
 
 // Service de swap
@@ -46,7 +50,7 @@ export class SwapService {
     amountInWei: bigint, 
     inDecimals: number
   ): Promise<any[]> {
-    const feeTiers = [500, 3000, 10000];
+    const feeTiers = [3000, 10000, 500]; // Prioriser 3000 (plus liquide)
     let lastError: any;
 
     // Essayer d'abord avec le fee du pool trouvé
@@ -182,9 +186,26 @@ export class SwapService {
   async executeSwap(
     params: SwapParams,
     privateKey: string,
-    options: { dryRun?: boolean } = {}
+    options: { 
+      dryRun?: boolean; 
+      swapEngine?: 'v3' | 'lifi' | 'auto';
+      routerOverride?: string;
+      npmOverride?: string;
+      factoryOverride?: string;
+    } = {}
   ): Promise<SwapResult> {
-    const { dryRun = CONSTANTS.DRY_RUN } = options;
+    const { 
+      dryRun = false, 
+      swapEngine = 'v3',
+      routerOverride,
+      npmOverride,
+      factoryOverride
+    } = options;
+
+    logger.info({
+      dryRun,
+      message: 'DEBUG: SwapService - dryRun reçu'
+    });
 
     try {
       // Obtenir le quote
@@ -235,8 +256,9 @@ export class SwapService {
         };
       }
 
-      // Créer le signer
-      const signer = createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      // Créer le signer avec provider
+      const provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const signer = new ethers.Wallet(privateKey, provider);
       const recipient = await signer.getAddress();
 
       // Convertir amountIn en BigInt si nécessaire
@@ -244,7 +266,29 @@ export class SwapService {
         ? ethers.parseUnits(params.amountIn, await this.getTokenDecimals(params.tokenIn))
         : params.amountIn;
 
-      // Vérifier et approuver les tokens si nécessaire
+      // Vérification de factory (pré-flight)
+      const factoryCheck = await factoryChecker.checkWithOverrides(
+        quote.pool.address,
+        routerOverride,
+        npmOverride,
+        factoryOverride
+      );
+
+      if (!factoryCheck.isCompatible) {
+        const errorMessage = `Factory mismatch détecté:\n` +
+          `Pool: ${quote.pool.address} (factory: ${factoryCheck.poolFactory})\n` +
+          `Router: ${routerOverride || CONSTANTS.UNIV3.SWAP_ROUTER_02} (factory: ${factoryCheck.routerFactory})\n` +
+          `NPM: ${npmOverride || CONSTANTS.UNIV3.NF_POSITION_MANAGER} (factory: ${factoryCheck.npmFactory})\n\n` +
+          `Re-lancer avec --router/--npm du DEX hébergeant le pool ${quote.pool.address}`;
+        
+        throw new Error(errorMessage);
+      }
+
+      logger.info({
+        message: 'Vérification factory OK - toutes les factories sont compatibles'
+      });
+
+      // Vérifier et approuver les tokens si nécessaire (ERC20 -> Permit2)
       await this.ensureTokenApproval(
         params.tokenIn,
         CONSTANTS.UNIV3.SWAP_ROUTER_02,
@@ -252,62 +296,75 @@ export class SwapService {
         signer
       );
 
-      // Préparer les paramètres du swap - ORDRE CORRECT pour exactInputSingle
+      // Vérifier et approuver Permit2 -> Router
+      await this.ensurePermit2Approval(
+        params.tokenIn,
+        amountInBigInt,
+        signer
+      );
+
+      // Fallback : approuver directement le router (pour les overloads sans Permit2)
+      await this.ensureDirectRouterApproval(
+        params.tokenIn,
+        amountInBigInt,
+        signer
+      );
+
+      // Créer le router avec le signer (pas le provider)
+      const router = new ethers.Contract(SWAP_ROUTER_02_ADDRESS, SWAP_ROUTER_02_ABI, signer);
+
+      // Préparer les paramètres du swap - SwapRouter02 avec payerIsUser
       const swapParams = {
         tokenIn: params.tokenIn,
         tokenOut: params.tokenOut,
         fee: quote.pool.fee,
         recipient,
-        amountIn: amountInBigInt,         // <-- amountIn AVANT amountOutMinimum
-        amountOutMinimum: amountOutMin,   // <-- puis amountOutMinimum
+        amountIn: amountInBigInt,
+        amountOutMinimum: amountOutMin,
         sqrtPriceLimitX96: 0n,
+        payerIsUser: true  // ⚠️ OBLIGATOIRE pour SwapRouter02 + Permit2
       };
 
-      // Estimer le gas
-      const gasLimit = await estimateGasLimit(
-        this.router,
-        'exactInputSingle',
-        [swapParams],
-        { value: params.tokenIn === CONSTANTS.NATIVE_ADDRESS ? amountInBigInt : 0n }
-      );
-
-      // Obtenir le gas price
-      const gasPrice = await getGasPrice(signer.provider! as any);
-
-      // Exécuter le swap
-      const tx = await withRetryTransaction(async () => {
-        return await this.router.exactInputSingle(swapParams, {
-          value: params.tokenIn === CONSTANTS.NATIVE_ADDRESS ? amountInBigInt : 0n,
-          gasLimit,
-          gasPrice,
-        });
-      });
-
       logger.info({
-        txHash: tx.hash,
-        message: 'Transaction de swap envoyée'
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        fee: quote.pool.fee,
+        amountIn: amountInBigInt.toString(),
+        amountOutMinimum: amountOutMin.toString(),
+        payerIsUser: true,
+        message: 'Paramètres SwapRouter02 préparés'
       });
 
-      // Attendre la confirmation
-      const receipt = await tx.wait();
+      // Utiliser uniquement exactInput (path bytes) - chemin simple et fiable
+      const swapResult = await this.executeExactInputSwap(router, {
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        fee: quote.pool.fee,
+        recipient,
+        amountIn: amountInBigInt,
+        amountOutMinimum: amountOutMin,
+        sqrtPriceLimitX96: 0n,
+      }, recipient, privateKey, provider);
 
-      if (!receipt) {
-        throw new Error('Transaction de swap échouée');
+      if (!swapResult.success) {
+        throw new Error(`Swap exactInput échoué: ${swapResult.error}`);
       }
 
+      // Le swap a réussi
       logger.info({
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        gasUsed: receipt.gasUsed.toString(),
-        message: 'Swap exécuté avec succès'
+        txHash: swapResult.txHash,
+        amountOut: swapResult.amountOut?.toString(),
+        gasUsed: swapResult.gasUsed?.toString(),
+        message: 'Swap exactInput exécuté avec succès'
       });
 
       return {
         pool: quote.pool,
-        amountOut: quote.amountOut,
+        amountOut: swapResult.amountOut || quote.amountOut,
         amountOutMin,
-        txHash: receipt.hash,
         success: true,
+        txHash: swapResult.txHash || 'unknown',
+        gasUsed: swapResult.gasUsed?.toString() || '0',
       };
 
     } catch (error) {
@@ -354,47 +411,238 @@ export class SwapService {
       return;
     }
 
+    // V3SwapRouter02 utilise Permit2, donc on approuve Permit2 au lieu du router
+
     const token = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, signer);
     const owner = await signer.getAddress();
 
     // Vérifier l'allowance actuelle
     const allowance = await withRetryRpc(async () => {
-      return await token.allowance(owner, spender);
+      return await token.allowance(owner, PERMIT2_ADDRESS);
     });
 
     if (allowance >= amount) {
       logger.debug({
         tokenAddress,
-        spender,
+        spender: PERMIT2_ADDRESS,
         allowance: allowance.toString(),
         amount: amount.toString(),
-        message: 'Allowance suffisante'
+        message: 'Allowance ERC20 -> Permit2 suffisante'
       });
       return;
     }
 
     logger.info({
       tokenAddress,
-      spender,
+      spender: PERMIT2_ADDRESS,
       allowance: allowance.toString(),
       amount: amount.toString(),
-      message: 'Approbation du token nécessaire'
+      message: 'Approbation ERC20 -> Permit2 nécessaire'
     });
 
-    // Approuver le token
+    // Approuver le token pour Permit2
     const approveTx = await withRetryTransaction(async () => {
-      return await token.approve(spender, amount);
+      return await token.approve(PERMIT2_ADDRESS, ethers.MaxUint256);
     });
-
-    await approveTx.wait();
 
     logger.info({
       tokenAddress,
-      spender,
-      amount: amount.toString(),
+      spender: PERMIT2_ADDRESS,
       txHash: approveTx.hash,
-      message: 'Token approuvé'
+      message: 'Token approuvé pour Permit2'
     });
+
+    await approveTx.wait();
+  }
+
+  // S'assurer que Permit2 a l'allowance interne vers le router
+  private async ensurePermit2Approval(
+    tokenAddress: string,
+    amount: bigint,
+    signer: ethers.Wallet
+  ): Promise<void> {
+    const permit2 = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, signer);
+    const owner = await signer.getAddress();
+
+    // Vérifier l'allowance interne Permit2
+    const [pAmount] = await withRetryRpc(async () => {
+      return await permit2.allowance(owner, tokenAddress, SWAP_ROUTER_02_ADDRESS);
+    });
+
+    logger.info({
+      tokenAddress,
+      permit2Allowance: pAmount.toString(),
+      requiredAmount: amount.toString(),
+      message: 'Vérification allowance Permit2 -> Router'
+    });
+
+    if (pAmount >= amount) {
+      logger.debug({
+        tokenAddress,
+        permit2Allowance: pAmount.toString(),
+        amount: amount.toString(),
+        message: 'Allowance Permit2 -> Router suffisante'
+      });
+      return;
+    }
+
+    logger.info({
+      tokenAddress,
+      permit2Allowance: pAmount.toString(),
+      amount: amount.toString(),
+      message: 'Approbation Permit2 -> Router nécessaire'
+    });
+
+    // Approuver Permit2 vers le router
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const expiration = now + ONE_YEAR;
+
+    const approveTx = await withRetryTransaction(async () => {
+      return await permit2.approve(tokenAddress, SWAP_ROUTER_02_ADDRESS, MAX_UINT160, expiration);
+    });
+
+    logger.info({
+      tokenAddress,
+      spender: SWAP_ROUTER_02_ADDRESS,
+      txHash: approveTx.hash,
+      message: 'Permit2 approuvé pour Router'
+    });
+
+    await approveTx.wait();
+  }
+
+  private async ensureDirectRouterApproval(
+    tokenAddress: string,
+    amount: bigint,
+    signer: ethers.Wallet
+  ): Promise<void> {
+    const token = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, signer);
+    const owner = await signer.getAddress();
+    
+    // Vérifier l'allowance directe ERC20 -> Router
+    const allowance = await withRetryRpc(async () => {
+      return await token.allowance(owner, SWAP_ROUTER_02_ADDRESS);
+    });
+    
+    if (allowance < amount) {
+      logger.info({
+        tokenAddress,
+        requiredAmount: amount.toString(),
+        currentAllowance: allowance.toString(),
+        message: 'Approbation directe ERC20 -> Router nécessaire'
+      });
+      
+      const tx = await withRetryTransaction(async () => {
+        return await token.approve(SWAP_ROUTER_02_ADDRESS, ethers.MaxUint256);
+      });
+      
+      await tx.wait();
+      
+      logger.info({
+        txHash: tx.hash,
+        tokenAddress,
+        spender: SWAP_ROUTER_02_ADDRESS,
+        amount: ethers.MaxUint256.toString(),
+        message: 'Approbation directe ERC20 -> Router confirmée'
+      });
+    } else {
+      logger.info({
+        tokenAddress,
+        directAllowance: allowance.toString(),
+        requiredAmount: amount.toString(),
+        message: 'Vérification allowance directe ERC20 -> Router'
+      });
+    }
+  }
+
+  // Méthode simplifiée : utiliser uniquement exactInput (path bytes)
+  private async executeExactInputSwap(
+    router: ethers.Contract,
+    params: {
+      tokenIn: string;
+      tokenOut: string;
+      fee: number;
+      recipient: string;
+      amountIn: bigint;
+      amountOutMinimum: bigint;
+      sqrtPriceLimitX96: bigint;
+    },
+    from: string,
+    privateKey: string,
+    provider: ethers.Provider
+  ): Promise<{ success: boolean; txHash?: string; amountOut?: bigint; gasUsed?: bigint; error?: string }> {
+    const { tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum } = params;
+
+    try {
+      logger.info({ 
+        message: 'Exécution swap exactInput (path bytes)',
+        tokenIn,
+        tokenOut,
+        fee,
+        amountIn: amountIn.toString(),
+        amountOutMinimum: amountOutMinimum.toString()
+      });
+      
+      // Garde-fou : s'assurer que l'allowance directe ERC20 → Router est suffisante
+      const signer = new ethers.Wallet(privateKey, provider);
+      await this.ensureDirectRouterApproval(tokenIn, amountIn, signer);
+      
+      // Construire le path: tokenIn (20) | fee (3) | tokenOut (20)
+      const path = ethers.solidityPacked(
+        ['address', 'uint24', 'address'],
+        [tokenIn, fee, tokenOut]
+      );
+
+      const exactInputParams = {
+        path,
+        recipient,
+        amountIn,
+        amountOutMinimum
+      };
+
+      // Test avec callStatic d'abord
+      await router.getFunction('exactInput((bytes,address,uint256,uint256))').staticCall(exactInputParams, { from, value: 0n });
+      logger.info({ message: 'callStatic exactInput réussi' });
+
+      // Exécuter la transaction
+      const gasLimit = await router.getFunction('exactInput((bytes,address,uint256,uint256))').estimateGas(exactInputParams, { from, value: 0n });
+      const gasPrice = await getGasPrice(provider);
+
+      const tx = await withRetryTransaction(async () => {
+        return await router.getFunction('exactInput((bytes,address,uint256,uint256))')(exactInputParams, {
+          from,
+          value: 0n,
+          gasLimit,
+          gasPrice,
+        });
+      });
+
+      const receipt = await tx.wait();
+      if (!receipt) throw new Error('Transaction échouée');
+
+      logger.info({
+        txHash: receipt.hash,
+        gasUsed: receipt.gasUsed.toString(),
+        message: 'Swap exactInput exécuté avec succès'
+      });
+
+      return {
+        success: true,
+        txHash: receipt.hash,
+        amountOut: amountOutMinimum, // Approximation
+        gasUsed: receipt.gasUsed
+      };
+    } catch (error) {
+      logger.error({
+        error: error.message,
+        message: 'Swap exactInput échoué'
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
   }
 }
 
