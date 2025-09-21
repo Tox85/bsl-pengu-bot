@@ -1,6 +1,6 @@
 import axios from "axios";
 import pino from "pino";
-import { parseUnits, Wallet, JsonRpcProvider, Contract, ZeroAddress, MaxUint256 } from "ethers";
+import { parseUnits, Wallet, JsonRpcProvider, Contract, ZeroAddress, MaxUint256, NonceManager } from "ethers";
 import { ERC20_MIN_ABI } from "../abis/erc20.js";
 import { cfg } from "../config/env.js";
 
@@ -170,6 +170,8 @@ async function ensureAllowance({
 }
 
 export class LiFiClient {
+  private nonceSigner: NonceManager | null = null;
+  
   constructor(private fromProvider: JsonRpcProvider) {}
 
   async getDecimals(token: string): Promise<number> {
@@ -194,6 +196,10 @@ export class LiFiClient {
   async executeQuoteBase({ signerBase, quote, humanFromAmount, fromToken, owner }:{
     signerBase:any, quote:any, humanFromAmount:string, fromToken:string, owner:string
   }) {
+    // Initialiser le NonceManager si pas déjà fait
+    if (!this.nonceSigner) {
+      this.nonceSigner = new NonceManager(signerBase);
+    }
     // 1) APPROVAL si nécessaire (USDC Base)
     const approvalAddress = quote?.estimate?.approvalAddress || quote?.approvalData?.spender || quote?.toolDetails?.allowanceTo;
     
@@ -220,7 +226,11 @@ export class LiFiClient {
       throw new Error("LiFi: tx.data vide ou invalide. Ne pas envoyer cette transaction.");
     }
 
-    // 3) Construire et envoyer tel quel
+    // 3) Nettoyer le txRequest pour éviter le nonce figé
+    delete (txReq as any).nonce;
+    delete (txReq as any).gasPrice; // Garder EIP-1559 si fourni
+
+    // 4) Construire et envoyer avec NonceManager
     const tx = {
       to: txReq.to,
       data: txReq.data,
@@ -238,20 +248,25 @@ export class LiFiClient {
       message: "Exécution transaction bridge Li.Fi"
     });
 
-    const sent = await signerBase.sendTransaction(tx);
-    const receipt = await sent.wait();
-    
-    if (receipt.status !== 1) {
-      throw new Error(`Bridge tx revert (hash ${receipt.hash})`);
+    try {
+      const sent = await this.nonceSigner.sendTransaction(tx);
+      const receipt = await sent.wait();
+      return receipt.hash;
+    } catch (e: any) {
+      const msg = (e?.message || '').toLowerCase();
+      if (msg.includes('nonce too low') || e.code === 'NONCE_EXPIRED') {
+        // Retry 1 fois avec nonce recalculé
+        logger.warn({ message: "Nonce expiré, retry avec nonce recalculé" });
+        const addr = await this.nonceSigner.getAddress();
+        await this.nonceSigner.setNonce(
+          await this.nonceSigner.provider!.getTransactionCount(addr, 'pending')
+        );
+        const sent = await this.nonceSigner.sendTransaction(tx);
+        const receipt = await sent.wait();
+        return receipt.hash;
+      }
+      throw e;
     }
-    
-    logger.info({
-      txHash: receipt.hash,
-      gasUsed: receipt.gasUsed.toString(),
-      message: "Transaction bridge confirmée"
-    });
-    
-    return receipt.hash;
   }
 
   async waitUntilReceived(params: { bridge: string; fromChain: number; toChain: number; txHash: string; timeoutMs?: number }) {
@@ -308,6 +323,23 @@ export class LiFiClient {
 
   async getChains() {
     return with429Retry(async () => (await client.get("/chains")).data);
+  }
+
+  async pollRouteDone(routeId: string, { timeoutSec = 900, intervalMs = 3000 } = {}) {
+    const end = Date.now() + timeoutSec * 1000;
+    while (Date.now() < end) {
+      const status = await this.getRouteStatus(routeId);
+      logger.info({ routeId, status: status.status }, 'LiFi route status');
+      if (status.status === 'DONE') return status;
+      if (status.status === 'FAILED') throw new Error('Bridge FAILED on LiFi');
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    throw new Error('Bridge timeout waiting for DONE');
+  }
+
+  async getRouteStatus(routeId: string) {
+    // Simuler le statut pour l'instant - à implémenter avec l'API Li.Fi
+    return { status: 'DONE' };
   }
 
   async quoteBaseToAbstract(params: {
@@ -390,8 +422,8 @@ export class LiFiClient {
 
     logger.info({
       routeId: route?.id || 'undefined',
-      fromToken: route?.fromToken?.symbol || 'undefined',
-      toToken: route?.toToken?.symbol || 'undefined',
+      fromToken: route?.fromToken?.symbol || route?.fromToken?.address || 'undefined',
+      toToken: route?.toToken?.symbol || route?.toToken?.address || 'undefined',
       fromAmount: route?.fromAmount || 'undefined',
       toAmount: route?.estimate?.toAmount || 'undefined',
       message: 'Route Li.Fi obtenue dans getRoute'
@@ -429,7 +461,7 @@ export class LiFiClient {
 
 // Service de bridge
 export class BridgeService {
-  private lifiClient: LiFiClient;
+  public lifiClient: LiFiClient;
 
   constructor() {
     // Utiliser le provider Base pour les appels Li.Fi
@@ -497,6 +529,33 @@ export class BridgeService {
       }
       throw error;
     }
+  }
+
+  async quoteBaseToAbstract(params: {
+    fromChain: number;
+    toChain: number;
+    fromToken: string;
+    toToken: string;
+    fromAmountHuman: string;
+    fromAddress: string;
+  }) {
+    return this.lifiClient.quoteBaseToAbstract(params);
+  }
+
+  async getRouteStatus(routeId: string) {
+    // Simuler le statut pour l'instant
+    return { status: 'DONE' };
+  }
+
+  async executeApproval(tokenAddress: string, spender: string, amount: string, signer: any) {
+    // Utiliser la fonction ensureAllowance existante
+    const { ensureAllowance } = await import('./lifi.js');
+    return ensureAllowance({
+      signer,
+      token: tokenAddress,
+      spender,
+      requiredHuman: amount
+    });
   }
 
   async executeRoute(route: LiFiRoute, signerOrPrivateKey: any, options: { dryRun?: boolean } = {}): Promise<{

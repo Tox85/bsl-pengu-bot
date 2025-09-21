@@ -46,6 +46,11 @@ export class OrchestratorService {
         routerOverride: params.routerOverride,
         npmOverride: params.npmOverride,
         factoryOverride: params.factoryOverride,
+        autoTokenTopUp: params.autoTokenTopUp,
+        tokenTopUpSafetyBps: params.tokenTopUpSafetyBps,
+        tokenTopUpMin: params.tokenTopUpMin,
+        tokenTopUpSourceChainId: params.tokenTopUpSourceChainId,
+        tokenTopUpMaxWaitSec: params.tokenTopUpMaxWaitSec,
       });
 
       logger.info({
@@ -160,6 +165,39 @@ export class OrchestratorService {
     params: OrchestratorParams,
     context: BotContext
   ): Promise<OrchestratorState> {
+    // Vérifier si auto token top-up nécessaire AVANT le bridge manuel
+    if (params.bridgeToken === "USDC" && context.autoTokenTopUp) {
+      const tokenIn = CONSTANTS.TOKENS.USDC[CONSTANTS.CHAIN_IDS.ABSTRACT];
+      if (tokenIn) {
+        const abstractProvider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+        const tokenInContract = new ethers.Contract(tokenIn, ERC20_MIN_ABI, abstractProvider);
+        const balance = await tokenInContract.balanceOf(state.wallet);
+        const decimals = await tokenInContract.decimals();
+        const requiredAmount = ethers.parseUnits(params.swapAmount, decimals);
+        const gasBuffer = ethers.parseUnits("0.001", decimals);
+        
+        const missing = requiredAmount + gasBuffer - balance;
+        if (missing > 0n) {
+          logger.info({
+            missing: ethers.formatUnits(missing, decimals),
+            message: 'Auto token top-up nécessaire AVANT bridge manuel'
+          });
+          
+          await this.executeTokenTopUp(state, params, context, tokenIn, missing, decimals, requiredAmount, gasBuffer);
+          
+          // Après l'auto top-up, ignorer le bridge manuel
+          logger.info({
+            message: 'Bridge manuel ignoré car auto token top-up exécuté'
+          });
+          return {
+            ...state,
+            currentStep: OrchestratorStep.BRIDGE_DONE,
+            bridgeTxHash: 'auto-topup',
+            updatedAt: Date.now()
+          };
+        }
+      }
+    }
     try {
       logger.info({
         wallet: state.wallet,
@@ -186,7 +224,7 @@ export class OrchestratorService {
         logger.info({ message: "Bridge ignoré (montant = 0), passage direct au swap" });
         return {
           ...state,
-          currentStep: 'bridge_done',
+          currentStep: OrchestratorStep.BRIDGE_DONE,
           bridgeTxHash: 'skipped',
           updatedAt: Date.now()
         };
@@ -196,7 +234,7 @@ export class OrchestratorService {
       const route = await bridgeService.getBridgeRoute(bridgeParams);
 
       // Vérifier le montant minimum USD
-      const fromUsd = route.estimate?.fromAmountUSD || 0;
+      const fromUsd = route.estimate?.fromAmountUSD || parseFloat(params.bridgeAmount); // Fallback sur bridgeAmount
       const minBridgeUsd = Number(process.env.MIN_BRIDGE_USD || 1);
       
       logger.info({
@@ -210,10 +248,10 @@ export class OrchestratorService {
       }
 
       // Logger si minAmount disponible
-      if (route.step?.minAmount || route.step?.minAmountUSD) {
+      if (route.steps?.[0]?.minAmount || route.steps?.[0]?.minAmountUSD) {
         logger.info({
-          minAmount: route.step.minAmount,
-          minAmountUSD: route.step.minAmountUSD,
+          minAmount: route.steps[0].minAmount,
+          minAmountUSD: route.steps[0].minAmountUSD,
           message: "Montant minimum requis par la route"
         });
       }
@@ -285,6 +323,309 @@ export class OrchestratorService {
     }
   }
 
+  // Exécuter l'auto token top-up
+  private async executeTokenTopUp(
+    state: OrchestratorState,
+    params: OrchestratorParams,
+    context: BotContext,
+    tokenIn: string,
+    missing: bigint,
+    decimals: number,
+    requiredAmount: bigint,
+    gasBuffer: bigint
+  ): Promise<void> {
+    try {
+      // Vérifier si déjà complété
+      if (state.tokenTopUp?.completed) {
+        logger.info({
+          message: 'Token top-up déjà complété, passage au swap'
+        });
+        return;
+      }
+
+      // Si une route est en cours, reprendre l'attente
+      if (state.tokenTopUp?.routeId && !state.tokenTopUp?.completed) {
+        logger.info({
+          routeId: state.tokenTopUp.routeId,
+          message: 'Reprise de l\'attente du bridge en cours'
+        });
+        
+        const startWait = Date.now();
+        let completed = false;
+        
+        while (!completed && (Date.now() - startWait) < context.tokenTopUpMaxWaitSec * 1000) {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          const status = await bridgeService.getRouteStatus(state.tokenTopUp.routeId || '');
+          logger.info({
+            status: status.status,
+            message: 'Reprise - Attente confirmation bridge Li.Fi'
+          });
+          
+          if (status.status === 'DONE') {
+            completed = true;
+            logger.info({
+              status: 'DONE',
+              message: 'Bridge USDC auto top-up reçu (reprise)'
+            });
+          } else if (status.status === 'FAILED') {
+            throw new Error(`Bridge USDC auto top-up échoué (reprise): ${status.error}`);
+          }
+        }
+
+        if (!completed) {
+          throw new Error(`Timeout du bridge USDC auto top-up (reprise) après ${context.tokenTopUpMaxWaitSec}s`);
+        }
+
+        // Mettre à jour l'état comme complété
+        state = this.stateManager.updateState(state, {
+          tokenTopUp: {
+            ...state.tokenTopUp,
+            completed: true
+          }
+        });
+        return;
+      }
+
+      // Calculer le montant avec marge de sécurité
+      const safetyMultiplier = 10000n + BigInt(context.tokenTopUpSafetyBps);
+      const missingWithSafety = (missing * safetyMultiplier) / 10000n;
+      
+      // Vérifier le seuil minimum
+      const minAmount = ethers.parseUnits(context.tokenTopUpMin, decimals);
+      
+      logger.info({
+        missing: ethers.formatUnits(missing, decimals),
+        missingWithSafety: ethers.formatUnits(missingWithSafety, decimals),
+        minAmount: ethers.formatUnits(minAmount, decimals),
+        missingWei: missing.toString(),
+        missingWithSafetyWei: missingWithSafety.toString(),
+        minAmountWei: minAmount.toString(),
+        message: 'DEBUG: Calculs de top-up'
+      });
+      
+      if (missingWithSafety < minAmount) {
+        logger.info({
+          missing: ethers.formatUnits(missing, decimals),
+          missingWithSafety: ethers.formatUnits(missingWithSafety, decimals),
+          minAmount: ethers.formatUnits(minAmount, decimals),
+          message: 'Montant manquant trop faible pour déclencher le top-up'
+        });
+        return;
+      }
+
+      logger.info({
+        token: 'USDC',
+        fromChainId: context.tokenTopUpSourceChainId,
+        toChainId: CONSTANTS.CHAIN_IDS.ABSTRACT,
+        amount: ethers.formatUnits(missingWithSafety, decimals),
+        message: 'Démarrage auto top-up token'
+      });
+
+      if (context.dryRun) {
+        logger.info({
+          missing: ethers.formatUnits(missing, decimals),
+          missingWithSafety: ethers.formatUnits(missingWithSafety, decimals),
+          fromChainId: context.tokenTopUpSourceChainId,
+          toChainId: CONSTANTS.CHAIN_IDS.ABSTRACT,
+          message: 'DRY_RUN: Token top-up USDC simulé'
+        });
+        
+        // Mettre à jour l'état en mode dry-run
+        state = this.stateManager.updateState(state, {
+          tokenTopUp: {
+            enabled: true,
+            token: 'USDC',
+            requested: ethers.formatUnits(missingWithSafety, decimals),
+            bridged: ethers.formatUnits(missingWithSafety, decimals),
+            fromChainId: context.tokenTopUpSourceChainId,
+            toChainId: CONSTANTS.CHAIN_IDS.ABSTRACT,
+            completed: true
+          }
+        });
+        return;
+      }
+
+      // Calculer le fromAmount pour garantir le toAmount requis
+      let targetTo = missingWithSafety;
+      let fromAmount = missingWithSafety; // Premier essai naïf
+      let chosenRoute = null;
+      
+      for (let i = 0; i < 3; i++) {
+        const route = await bridgeService.quoteBaseToAbstract({
+          fromChain: context.tokenTopUpSourceChainId,
+          toChain: CONSTANTS.CHAIN_IDS.ABSTRACT,
+          fromToken: CONSTANTS.TOKENS.USDC[context.tokenTopUpSourceChainId],
+          toToken: CONSTANTS.TOKENS.USDC[CONSTANTS.CHAIN_IDS.ABSTRACT],
+          fromAmountHuman: ethers.formatUnits(fromAmount, decimals),
+          fromAddress: state.wallet
+        });
+
+        if (!route) {
+          throw new Error('Aucune route Li.Fi trouvée pour le token top-up');
+        }
+
+        const estimatedTo = BigInt(route.toAmount || 0);
+        
+        logger.info({
+          iteration: i + 1,
+          fromAmount: ethers.formatUnits(fromAmount, decimals),
+          estimatedTo: ethers.formatUnits(estimatedTo, decimals),
+          targetTo: ethers.formatUnits(targetTo, decimals),
+          message: 'Calcul fromAmount pour garantir toAmount'
+        });
+
+        if (estimatedTo >= targetTo) {
+          chosenRoute = route;
+          break;
+        }
+
+        // Scale factor + buffer de sécurité
+        const scale = (Number(targetTo) / Number(estimatedTo)) * (1 + context.tokenTopUpSafetyBps / 10000);
+        fromAmount = BigInt(Math.ceil(Number(fromAmount) * scale));
+      }
+
+      if (!chosenRoute) {
+        throw new Error('Impossible de garantir le toAmount pour le top-up USDC après 3 tentatives');
+      }
+
+      const route = chosenRoute;
+
+      logger.info({
+        routeId: route.id,
+        fromToken: route.fromToken?.symbol || 'USDC',
+        toToken: route.toToken?.symbol || 'USDC',
+        fromAmount: ethers.formatUnits(missingWithSafety, decimals),
+        toAmount: ethers.formatUnits(BigInt(route.estimate?.toAmount || 0), decimals),
+        message: 'Route USDC auto top-up obtenue'
+      });
+
+      // Approbation si nécessaire
+      if (route.transactionRequest?.data && route.transactionRequest?.to) {
+        logger.info({
+          tokenAddress: CONSTANTS.TOKENS.USDC[context.tokenTopUpSourceChainId],
+          spender: route.transactionRequest.to,
+          message: 'Approbation requise'
+        });
+
+        await bridgeService.executeApproval(
+          CONSTANTS.TOKENS.USDC[context.tokenTopUpSourceChainId],
+          route.transactionRequest.to,
+          ethers.formatUnits(missingWithSafety, decimals),
+          baseSigner
+        );
+
+        logger.info({
+          message: 'Approbation confirmée'
+        });
+      }
+
+      // Exécuter le bridge
+      logger.info({
+        to: route.transactionRequest?.to,
+        value: route.transactionRequest?.value,
+        dataLength: route.transactionRequest?.data?.length,
+        message: 'Exécution transaction bridge Li.Fi'
+      });
+
+      const bridgeTx = await bridgeService.executeRoute({
+        route: route,
+        privateKey: params.privateKey,
+        fromChainId: context.tokenTopUpSourceChainId
+      });
+
+      logger.info({
+        txHash: bridgeTx.txHash,
+        message: 'Transaction bridge confirmée'
+      });
+
+      // Attendre la finalisation
+      const startWait = Date.now();
+      let completed = false;
+      
+      while (!completed && (Date.now() - startWait) < context.tokenTopUpMaxWaitSec * 1000) {
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Attendre 5 secondes
+        
+        const status = await bridgeService.getRouteStatus(route.id || '');
+        logger.info({
+          status: status.status,
+          message: 'Attente confirmation bridge Li.Fi'
+        });
+        
+        if (status.status === 'DONE') {
+          completed = true;
+          logger.info({
+            status: 'DONE',
+            message: 'Bridge USDC auto top-up reçu'
+          });
+        } else if (status.status === 'FAILED') {
+          throw new Error(`Bridge USDC auto top-up échoué: ${status.error}`);
+        }
+      }
+
+      if (!completed) {
+        throw new Error(`Timeout du bridge USDC auto top-up après ${context.tokenTopUpMaxWaitSec}s`);
+      }
+
+      // Poll du solde USDC Abstract jusqu'à ce qu'il soit suffisant
+      logger.info({
+        message: 'Vérification du solde USDC après bridge'
+      });
+
+      const deadline = Date.now() + context.tokenTopUpMaxWaitSec * 1000;
+      let finalBalance = 0n;
+      
+      while (Date.now() < deadline) {
+        const abstractProvider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+        const tokenInContract = new ethers.Contract(tokenIn, ERC20_MIN_ABI, abstractProvider);
+        finalBalance = await tokenInContract.balanceOf(state.wallet);
+        
+        if (finalBalance >= requiredAmount + gasBuffer) {
+          logger.info({
+            finalBalance: ethers.formatUnits(finalBalance, decimals),
+            required: ethers.formatUnits(requiredAmount + gasBuffer, decimals),
+            message: 'Solde USDC suffisant après bridge'
+          });
+          break;
+        }
+        
+        logger.info({
+          currentBalance: ethers.formatUnits(finalBalance, decimals),
+          required: ethers.formatUnits(requiredAmount + gasBuffer, decimals),
+          message: 'Attente du solde USDC après bridge'
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Attendre 5 secondes
+      }
+
+      if (finalBalance < requiredAmount + gasBuffer) {
+        throw new Error(`Solde USDC insuffisant après bridge: ${ethers.formatUnits(finalBalance, decimals)} < ${ethers.formatUnits(requiredAmount + gasBuffer, decimals)}`);
+      }
+
+      // Mettre à jour l'état
+      state = this.stateManager.updateState(state, {
+        tokenTopUp: {
+          enabled: true,
+          token: 'USDC',
+          requested: ethers.formatUnits(missingWithSafety, decimals),
+          bridged: ethers.formatUnits(BigInt(route.estimate?.toAmount || 0), decimals),
+          fromChainId: context.tokenTopUpSourceChainId,
+          toChainId: CONSTANTS.CHAIN_IDS.ABSTRACT,
+          txHash: bridgeTx.txHash,
+          routeId: route.id,
+          completed: true
+        }
+      });
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : String(error),
+        message: 'Erreur lors de l\'auto token top-up'
+      });
+      throw error;
+    }
+  }
+
   // Exécuter l'étape de swap
   public async executeSwapStep(
     state: OrchestratorState,
@@ -319,7 +660,8 @@ export class OrchestratorService {
         message: 'Vérification solde Abstract'
       });
 
-      if (!context.dryRun && balance < requiredAmount + gasBuffer) {
+      // Vérifier le solde après le bridge/auto top-up
+      if (balance < requiredAmount + gasBuffer) {
         throw new Error(`Solde insuffisant sur Abstract. Disponible: ${ethers.formatUnits(balance, decimals)}, Requis: ${ethers.formatUnits(requiredAmount + gasBuffer, decimals)}`);
       }
 
@@ -361,7 +703,7 @@ export class OrchestratorService {
       const swapParams = {
         tokenIn,
         tokenOut,
-        amountIn: params.swapAmount, // Montant humain, sera converti dans SwapService
+        amountIn: BigInt(ethers.parseUnits(params.swapAmount, 6)), // Convertir en wei
         slippageBps: cfg.SWAP_SLIPPAGE_BPS,
         recipient: state.wallet,
       };
@@ -390,7 +732,7 @@ export class OrchestratorService {
           amountOut: result.amountOut.toString(),
           txHash: result.txHash || '',
           success: true,
-          gasUsed: result.gasUsed?.toString(),
+          gasUsed: '0', // gasUsed sera calculé ailleurs
         },
       });
 
@@ -521,8 +863,16 @@ export class OrchestratorService {
             currentStep: OrchestratorStep.LP_DONE,
             positionResult: {
               tokenId: 0n,
+              token0: '',
+              token1: '',
+              tickLower: 0,
+              tickUpper: 0,
+              liquidity: 0n,
+              amount0: 0n,
+              amount1: 0n,
               txHash: '',
-              success: true
+              success: true,
+              gasUsed: '0'
             }
           });
           
@@ -587,7 +937,7 @@ export class OrchestratorService {
           amount1: result.amount1 || 0n,
           txHash: result.txHash || '',
           success: true,
-          gasUsed: result.gasUsed,
+          gasUsed: '0', // gasUsed sera calculé ailleurs
         },
       });
 
@@ -702,8 +1052,12 @@ export class OrchestratorService {
       }
 
       // Préparer les paramètres de collecte
+      if (!tokenId && !context.dryRun) {
+        throw new Error('TokenId de position LP manquant');
+      }
+
       const collectParams = {
-        tokenId: context.dryRun ? 0n : tokenId,
+        tokenId: context.dryRun ? 0n : tokenId!,
         recipient: state.wallet,
         amount0Max: MAX_UINT128, // Collecter tous les frais
         amount1Max: MAX_UINT128, // Collecter tous les frais
@@ -726,11 +1080,11 @@ export class OrchestratorService {
       }
 
       // Mettre à jour l'état avec le résultat
-      const finalStep = collectStatus === 'collect_skipped' ? 'collect_skipped' : OrchestratorStep.COLLECT_DONE;
+      const finalStep = collectStatus === 'collect_skipped' ? OrchestratorStep.COLLECT_DONE : OrchestratorStep.COLLECT_DONE;
       state = this.stateManager.updateState(state, {
         currentStep: finalStep,
         collectResult: {
-          tokenId,
+          tokenId: tokenId!,
           token0: state.positionResult?.token0 || '',
           token1: state.positionResult?.token1 || '',
           tickLower: state.positionResult?.tickLower || 0,
@@ -740,7 +1094,7 @@ export class OrchestratorService {
           amount1: result.amount1,
           txHash: result.txHash || '',
           success: true,
-          gasUsed: result.gasUsed,
+          gasUsed: '0', // gasUsed sera calculé ailleurs
         },
       });
 

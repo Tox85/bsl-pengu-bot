@@ -6,6 +6,17 @@ export interface OrchestratorState {
   swapResult?: SwapResult;
   positionResult?: PositionResult;
   collectResult?: PositionResult;
+  tokenTopUp?: {
+    enabled: boolean;
+    token: string;
+    requested: string;
+    bridged: string;
+    fromChainId: number;
+    toChainId: number;
+    txHash?: string;
+    routeId?: string;
+    completed: boolean;
+  };
   createdAt: number;
   updatedAt: number;
 }
@@ -44,6 +55,12 @@ export interface OrchestratorParams {
   routerOverride?: string;
   npmOverride?: string;
   factoryOverride?: string;
+  // Options d'auto token top-up
+  autoTokenTopUp?: boolean;
+  tokenTopUpSafetyBps?: number;
+  tokenTopUpMin?: string;
+  tokenTopUpSourceChainId?: number;
+  tokenTopUpMaxWaitSec?: number;
 }
 
 // Types pour les résultats de l'orchestrateur

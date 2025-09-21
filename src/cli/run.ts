@@ -6,7 +6,7 @@ dotenv.config();
 
 import { Command } from 'commander';
 import { ethers } from 'ethers';
-import { orchestratorService, OrchestratorService } from '../orchestrator/index.js';
+import { orchestratorService, OrchestratorService, OrchestratorStep } from '../orchestrator/index.js';
 import { CONSTANTS } from '../config/env.js';
 import { logger } from '../core/logger.js';
 import { parseAmount, formatAmount } from '../core/math.js';
@@ -28,18 +28,23 @@ program
   .command('full')
   .description('Exécuter le flow complet')
   .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
-  .requiredOption('--bridgeAmount <amount>', 'Montant à bridger')
-  .requiredOption('--bridgeToken <token>', 'Token de bridge (ETH|USDC)')
+  .option('--bridgeAmount <amount>', 'Montant à bridger (auto-calculé si non fourni)', '0')
+  .option('--bridgeToken <token>', 'Token de bridge (ETH|USDC)', 'USDC')
   .requiredOption('--swapAmount <amount>', 'Montant à swapper')
-  .requiredOption('--swapPair <pair>', 'Paire de swap (PENGU/ETH|PENGU/USDC)')
-  .requiredOption('--lpRange <percent>', 'Range LP en pourcentage')
-  .requiredOption('--collectAfter <minutes>', 'Minutes avant collecte des frais')
+  .option('--swapPair <pair>', 'Paire de swap (PENGU/ETH|PENGU/USDC)', 'PENGU/USDC')
+  .option('--lpRange <percent>', 'Range LP en pourcentage', '5')
+  .option('--collectAfter <minutes>', 'Minutes avant collecte des frais', '120')
   .option('--collectAfterBlocks <blocks>', 'Attendre X blocs avant collect (alternative à minutes)', '0')
   .option('--dry-run [value]', 'Mode simulation (pas de transaction réelle)', 'true')
   .option('--fresh', 'Démarrer avec un état propre (ignore .state)', false)
   .option('--autoGasTopUp [value]', 'Auto top-up du gas natif sur Abstract', 'true')
   .option('--minNativeOnDest <wei>', 'Montant minimum gas natif sur destination (wei)')
   .option('--gasTopUpTarget <wei>', 'Montant cible pour le top-up gas (wei)')
+  .option('--autoTokenTopUp [value]', 'Auto top-up du token de swap si solde insuffisant', 'true')
+  .option('--tokenTopUpSafetyBps <bps>', 'Marge de sécurité en BPS pour le top-up token', '50')
+  .option('--tokenTopUpMin <amount>', 'Montant minimum pour déclencher le top-up token', '0.10')
+  .option('--tokenTopUpSourceChainId <chainId>', 'Chaîne source pour le top-up token', '8453')
+  .option('--tokenTopUpMaxWaitSec <seconds>', 'Timeout d\'attente du bridge token (secondes)', '900')
   .option('--swapEngine <engine>', 'Moteur de swap (v3|lifi|auto)', 'v3')
   .option('--router <address>', 'Adresse du router V3 (override)')
   .option('--npm <address>', 'Adresse du NonfungiblePositionManager (override)')
@@ -75,10 +80,26 @@ program
         throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
       }
 
+      // Calculer automatiquement le bridgeAmount si nécessaire
+      let bridgeAmount = options.bridgeAmount;
+      if (bridgeAmount === '0' || !bridgeAmount) {
+        // Auto-calculer le montant nécessaire pour le swap
+        const swapAmount = parseFloat(options.swapAmount);
+        const safetyMultiplier = 1 + (parseInt(options.tokenTopUpSafetyBps) / 10000);
+        bridgeAmount = (swapAmount * safetyMultiplier).toFixed(6);
+        
+        logger.info({
+          swapAmount: options.swapAmount,
+          safetyMultiplier: safetyMultiplier,
+          calculatedBridgeAmount: bridgeAmount,
+          message: 'BridgeAmount auto-calculé'
+        });
+      }
+
       // Les options CLI ont priorité sur les constantes
       const params = {
         privateKey,
-        bridgeAmount: options.bridgeAmount,
+        bridgeAmount: bridgeAmount,
         bridgeToken: options.bridgeToken as 'ETH' | 'USDC',
         swapAmount: options.swapAmount,
         swapPair: options.swapPair as 'PENGU/ETH' | 'PENGU/USDC',
@@ -93,6 +114,12 @@ program
         routerOverride: options.router,
         npmOverride: options.npm,
         factoryOverride: options.factory,
+        // Options d'auto token top-up
+        autoTokenTopUp: toBool(options.autoTokenTopUp),
+        tokenTopUpSafetyBps: parseInt(options.tokenTopUpSafetyBps),
+        tokenTopUpMin: options.tokenTopUpMin,
+        tokenTopUpSourceChainId: parseInt(options.tokenTopUpSourceChainId),
+        tokenTopUpMaxWaitSec: parseInt(options.tokenTopUpMaxWaitSec),
       };
 
       const result = await orchestratorService.run(params);
@@ -333,14 +360,14 @@ program
         dryRun: false,
       });
 
-      if (result.success) {
+      if (result.executed) {
         console.log('\n✅ Frais collectés avec succès!');
         console.log(`  TX Hash: ${result.txHash}`);
         console.log(`  Montant0: ${result.amount0?.toString() || '0'}`);
         console.log(`  Montant1: ${result.amount1?.toString() || '0'}`);
       } else {
         console.log('\n❌ Échec de la collecte des frais:');
-        console.log(`  Erreur: ${result.error}`);
+        console.log(`  Status: ${result.status}`);
         process.exit(1);
       }
 
@@ -451,6 +478,11 @@ program
         npmOverride: undefined,
         factoryOverride: undefined,
         privateKey: privateKey,
+        autoTokenTopUp: toBool(options.autoTokenTopUp),
+        tokenTopUpSafetyBps: parseInt(options.tokenTopUpSafetyBps),
+        tokenTopUpMin: options.tokenTopUpMin,
+        tokenTopUpSourceChainId: parseInt(options.tokenTopUpSourceChainId),
+        tokenTopUpMaxWaitSec: parseInt(options.tokenTopUpMaxWaitSec),
       });
 
       const orchestrator = new OrchestratorService();
@@ -460,11 +492,13 @@ program
       const walletAddress = await signer.getAddress();
       const initialState = {
         wallet: asLowerHexAddress(walletAddress),
-        currentStep: 'swap_pending' as const,
+        currentStep: OrchestratorStep.SWAP_PENDING,
         bridgeResult: null,
         swapResult: null,
         positionResult: null,
         collectResult: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
         metrics: {
           startTime: Date.now(),
           endTime: 0,
@@ -530,6 +564,11 @@ program
         npmOverride: undefined,
         factoryOverride: undefined,
         privateKey: privateKey,
+        autoTokenTopUp: true,
+        tokenTopUpSafetyBps: 50,
+        tokenTopUpMin: '0.10',
+        tokenTopUpSourceChainId: 8453,
+        tokenTopUpMaxWaitSec: 900,
       });
 
       const orchestrator = new OrchestratorService();
@@ -539,11 +578,13 @@ program
       const walletAddress = await signer.getAddress();
       const initialState = {
         wallet: asLowerHexAddress(walletAddress),
-        currentStep: 'lp_pending' as const,
+        currentStep: OrchestratorStep.LP_PENDING,
         bridgeResult: null,
         swapResult: null,
         positionResult: null,
         collectResult: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
         metrics: {
           startTime: Date.now(),
           endTime: 0,

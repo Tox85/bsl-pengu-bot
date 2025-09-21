@@ -41,6 +41,16 @@ export interface BotContext {
   routerOverride?: string;
   npmOverride?: string;
   factoryOverride?: string;
+  
+  // Options d'auto token top-up
+  autoTokenTopUp: boolean;
+  tokenTopUpSafetyBps: number;
+  tokenTopUpMin: string;
+  tokenTopUpSourceChainId: number;
+  tokenTopUpMaxWaitSec: number;
+  
+  // Swap engine
+  swapEngine: 'v3' | 'lifi' | 'auto';
 }
 
 export function buildContext(params: {
@@ -53,6 +63,12 @@ export function buildContext(params: {
   routerOverride?: string;
   npmOverride?: string;
   factoryOverride?: string;
+  autoTokenTopUp?: boolean;
+  tokenTopUpSafetyBps?: number;
+  tokenTopUpMin?: string;
+  tokenTopUpSourceChainId?: number;
+  tokenTopUpMaxWaitSec?: number;
+  swapEngine?: 'v3' | 'lifi' | 'auto';
 }): BotContext {
   // Validation de la clé privée
   if (!params.privateKey.startsWith('0x') || params.privateKey.length !== 66) {
@@ -83,5 +99,13 @@ export function buildContext(params: {
     routerOverride: params.routerOverride,
     npmOverride: params.npmOverride,
     factoryOverride: params.factoryOverride,
+    // Options d'auto token top-up
+    autoTokenTopUp: params.autoTokenTopUp !== undefined ? toBool(params.autoTokenTopUp) : true,
+    tokenTopUpSafetyBps: params.tokenTopUpSafetyBps || 50,
+    tokenTopUpMin: params.tokenTopUpMin || '0.10',
+    tokenTopUpSourceChainId: params.tokenTopUpSourceChainId || 8453,
+    tokenTopUpMaxWaitSec: params.tokenTopUpMaxWaitSec || 900,
+    // Swap engine
+    swapEngine: params.swapEngine || 'v3',
   };
 }

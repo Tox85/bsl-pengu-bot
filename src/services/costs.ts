@@ -20,6 +20,19 @@ export interface CostMetrics {
     penguDelta: string; // ΔPENGU
     wethDelta: string; // ΔWETH (si applicable)
   };
+  bridge: {
+    tokenTopUp: {
+      enabled: boolean;
+      token: string;
+      requested: string;
+      bridged: string;
+      fromChainId: number;
+      toChainId: number;
+      txHash?: string;
+      routeId?: string;
+      completed: boolean;
+    } | null;
+  };
   total: {
     duration: number; // Durée totale en ms
     totalGasUsed: bigint;
@@ -199,6 +212,9 @@ export class CostsReporter {
       totalGas += BigInt(state.collectResult.gasUsed);
     }
     
+    // Note: Le gas du token top-up est inclus dans le bridgeResult
+    // car il utilise le même service de bridge
+    
     return totalGas;
   }
 
@@ -244,6 +260,9 @@ export class CostsReporter {
     if (state.bridgeResult?.success) {
       const bridgeGas = state.bridgeResult.gasUsed ? BigInt(state.bridgeResult.gasUsed) : 0n;
       console.log(`  ✅ Bridge: ${state.bridgeResult.txHash} (Gas: ${bridgeGas.toString()})`);
+    }
+    if (state.tokenTopUp?.completed) {
+      console.log(`  ✅ Token Top-up: ${state.tokenTopUp.token} ${state.tokenTopUp.requested} → ${state.tokenTopUp.bridged} (${state.tokenTopUp.txHash})`);
     }
     if (state.swapResult?.success) {
       const swapGas = state.swapResult.gasUsed ? BigInt(state.swapResult.gasUsed) : 0n;
