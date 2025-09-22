@@ -5,6 +5,7 @@ import { logger } from './logger.js';
 // Providers RPC
 export const baseProvider = new ethers.JsonRpcProvider(cfg.BASE_RPC_URL);
 export const abstractProvider = new ethers.JsonRpcProvider(cfg.ABSTRACT_RPC_URL);
+export const arbitrumProvider = new ethers.JsonRpcProvider(cfg.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc');
 
 // Fonction utilitaire pour obtenir le provider selon la chain
 export const getProvider = (chainId: number): ethers.JsonRpcProvider => {
@@ -13,6 +14,8 @@ export const getProvider = (chainId: number): ethers.JsonRpcProvider => {
       return baseProvider;
     case CONSTANTS.CHAIN_IDS.ABSTRACT:
       return abstractProvider;
+    case CONSTANTS.CHAIN_IDS.ARBITRUM:
+      return arbitrumProvider;
     default:
       throw new Error(`Chain ID non supporté: ${chainId}`);
   }

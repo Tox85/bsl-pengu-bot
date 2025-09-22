@@ -275,6 +275,108 @@ program
   });
 
 program
+  .command('direct')
+  .description('Créer une position LP directement avec les fonds disponibles sur Abstract (sans bridge)')
+  .option('--privateKey <key>', 'Clé privée du wallet (par défaut: depuis .env)')
+  .requiredOption('--pair <pair>', 'Paire de tokens (PENGU/ETH|PENGU/USDC)')
+  .requiredOption('--amount0 <amount>', 'Montant du token0 à utiliser')
+  .requiredOption('--amount1 <amount>', 'Montant du token1 à utiliser')
+  .option('--range <percent>', 'Range LP en pourcentage', '5')
+  .option('--collectAfter <minutes>', 'Minutes avant collecte des frais', '120')
+  .option('--dry-run [value]', 'Mode simulation (pas de transaction réelle)', 'true')
+  .option('--fresh', 'Démarrer avec un état propre (ignore .state)', false)
+  .option('--autoGasTopUp [value]', 'Auto top-up du gas natif sur Abstract', 'true')
+  .option('--minNativeOnDest <wei>', 'Montant minimum gas natif sur destination (wei)')
+  .option('--gasTopUpTarget <wei>', 'Montant cible pour le top-up gas (wei)')
+  .option('--fee <fee>', 'Fee tier du pool (500|3000|10000)')
+  .option('--debug-events', 'Afficher les logs d\'events détaillés', false)
+  .action(async (options) => {
+    try {
+      logger.info({
+        pair: options.pair,
+        amount0: options.amount0,
+        amount1: options.amount1,
+        range: options.range,
+        collectAfter: options.collectAfter,
+        dryRun: options.dryRun,
+        message: 'Démarrage du mode LP direct'
+      });
+
+      // Nettoyer l'état si --fresh
+      if (options.fresh) {
+        const fs = await import('fs');
+        try {
+          await fs.promises.rm('.state', { recursive: true, force: true });
+          logger.info({ message: 'État nettoyé (--fresh)' });
+        } catch (error) {
+          // Ignorer si le dossier n'existe pas
+        }
+      }
+
+      // Utiliser la clé privée du .env si pas fournie en paramètre
+      const privateKey = options.privateKey || process.env.PRIVATE_KEY;
+      if (!privateKey) {
+        throw new Error('Clé privée requise: fournissez --privateKey ou définissez PRIVATE_KEY dans .env');
+      }
+
+      // Exécuter le mode direct
+      const result = await orchestratorService.runDirect({
+        privateKey,
+        pair: options.pair as 'PENGU/ETH' | 'PENGU/USDC',
+        amount0: options.amount0,
+        amount1: options.amount1,
+        rangePercent: options.range,
+        collectAfterMinutes: parseInt(options.collectAfter),
+        dryRun: toBool(options.dryRun),
+        autoGasTopUp: toBool(options.autoGasTopUp),
+        minNativeOnDest: options.minNativeOnDest,
+        gasTopUpTarget: options.gasTopUpTarget,
+        fee: options.fee ? parseInt(options.fee) : undefined,
+      });
+
+      if (result.success) {
+        console.log('\n🎉 Mode LP direct exécuté avec succès!');
+        console.log(`  Étape finale: ${result.state.currentStep}`);
+        
+        if (result.state.positionResult) {
+          console.log(`\n🏊 Position LP:`);
+          console.log(`  TX Hash: ${result.state.positionResult.txHash}`);
+          console.log(`  Token ID: ${result.state.positionResult.tokenId?.toString()}`);
+          console.log(`  Liquidité: ${result.state.positionResult.liquidity?.toString()}`);
+          console.log(`  Montant0: ${result.state.positionResult.amount0?.toString()}`);
+          console.log(`  Montant1: ${result.state.positionResult.amount1?.toString()}`);
+        }
+
+        if (result.state.collectResult) {
+          console.log(`\n💰 Collecte des frais:`);
+          console.log(`  TX Hash: ${result.state.collectResult.txHash}`);
+          console.log(`  Montant0: ${result.state.collectResult.amount0?.toString()}`);
+          console.log(`  Montant1: ${result.state.collectResult.amount1?.toString()}`);
+        }
+
+        if (result.metrics) {
+          console.log(`\n📊 Métriques:`);
+          console.log(`  Durée totale: ${result.metrics.totalDuration}ms`);
+          if (result.metrics.totalFeesCollected) {
+            console.log(`  Frais collectés: ${result.metrics.totalFeesCollected.amount0.toString()} ${result.metrics.totalFeesCollected.token0} + ${result.metrics.totalFeesCollected.amount1.toString()} ${result.metrics.totalFeesCollected.token1}`);
+          }
+        }
+      } else {
+        console.log('\n❌ Mode LP direct échoué:');
+        console.log(`  Erreur: ${result.error}`);
+        process.exit(1);
+      }
+
+    } catch (error) {
+      logger.error({
+        error: error instanceof Error ? error.message : 'Unknown error',
+        message: 'Erreur lors de l\'exécution du mode LP direct'
+      });
+      process.exit(1);
+    }
+  });
+
+program
   .command('reset')
   .description('Réinitialiser l\'état de l\'orchestrateur')
   .requiredOption('--privateKey <key>', 'Clé privée du wallet')

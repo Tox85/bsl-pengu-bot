@@ -37,10 +37,41 @@ const logLevelSchema = z.enum(['debug', 'info', 'warn', 'error'], {
 
 // Schéma principal de configuration
 const configSchema = z.object({
-  // Wallets / RPC
+  // Wallets / RPC (mode single-wallet)
   PRIVATE_KEY: z.string().min(1, 'Clé privée requise'),
   BASE_RPC_URL: urlSchema,
   ABSTRACT_RPC_URL: urlSchema,
+  
+  // Multi-wallet configuration (optionnel)
+  MNEMONIC: z.string().optional(),
+  WALLET_COUNT: z.number().int().min(1).max(1000).optional().default(100),
+  HUB_WALLET_PRIVATE_KEY: z.string().optional(),
+  
+  // Bybit configuration (optionnel)
+  BYBIT_API_KEY: z.string().optional(),
+  BYBIT_API_SECRET: z.string().optional(),
+  BYBIT_SANDBOX: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(false),
+  BYBIT_TESTNET: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(false),
+  
+  // Distribution configuration
+  DISTRIBUTION_USDC_PER_WALLET: z.number().positive().optional().default(10.0),
+  DISTRIBUTION_ETH_PER_WALLET: z.number().positive().optional().default(0.005),
+  DISTRIBUTION_RANDOMIZE_AMOUNTS: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(true),
+  DISTRIBUTION_VARIATION_PERCENT: z.number().min(0).max(100).default(10),
+  
+  // Nouvelles configurations
+  NETWORK_WITHDRAW: z.string().default('ARBITRUM'),
+  WITHDRAW_ENABLED: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(true),
+  WITHDRAW_ASSET_USDC: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(true),
+  WITHDRAW_ASSET_ETH: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(false),
+  WITHDRAW_USDC_MIN: z.number().positive().default(10),
+  WITHDRAW_USDC_MAX: z.number().positive().default(100),
+  WITHDRAW_ETH_MIN: z.number().positive().default(0.01),
+  WITHDRAW_ETH_MAX: z.number().positive().default(0.1),
+  DISTRIB_TOPUP_ETH: z.number().positive().default(0.0001),
+  BYPASS_POLLING: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(false),
+  POLLING_TIMEOUT_MS: z.number().int().positive().default(300000),
+  POLLING_INTERVAL_MS: z.number().int().positive().default(10000),
   
   // Flow policy
   DRY_RUN: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(true),
@@ -111,6 +142,28 @@ const transformConfig = (raw: Record<string, string | undefined>) => {
     MAX_GAS_PRICE_GWEI: parseFloat(raw.MAX_GAS_PRICE_GWEI || '50'),
     MAX_RETRIES: parseInt(raw.MAX_RETRIES || '3'),
     RETRY_DELAY_MS: parseInt(raw.RETRY_DELAY_MS || '1000'),
+    
+    // Multi-wallet configuration
+    WALLET_COUNT: parseInt(raw.WALLET_COUNT || '100'),
+    BYBIT_SANDBOX: raw.BYBIT_SANDBOX === 'true',
+    BYBIT_TESTNET: raw.BYBIT_TESTNET === 'true',
+    DISTRIBUTION_USDC_PER_WALLET: parseFloat(raw.DISTRIBUTION_USDC_PER_WALLET || '10.0'),
+    DISTRIBUTION_ETH_PER_WALLET: parseFloat(raw.DISTRIBUTION_ETH_PER_WALLET || '0.005'),
+    DISTRIBUTION_RANDOMIZE_AMOUNTS: raw.DISTRIBUTION_RANDOMIZE_AMOUNTS === 'true',
+    DISTRIBUTION_VARIATION_PERCENT: parseFloat(raw.DISTRIBUTION_VARIATION_PERCENT || '10'),
+    
+    // Nouvelles configurations
+    WITHDRAW_ENABLED: raw.WITHDRAW_ENABLED === 'true',
+    WITHDRAW_ASSET_USDC: raw.WITHDRAW_ASSET_USDC === 'true',
+    WITHDRAW_ASSET_ETH: raw.WITHDRAW_ASSET_ETH === 'true',
+    WITHDRAW_USDC_MIN: parseFloat(raw.WITHDRAW_USDC_MIN || '10'),
+    WITHDRAW_USDC_MAX: parseFloat(raw.WITHDRAW_USDC_MAX || '100'),
+    WITHDRAW_ETH_MIN: parseFloat(raw.WITHDRAW_ETH_MIN || '0.01'),
+    WITHDRAW_ETH_MAX: parseFloat(raw.WITHDRAW_ETH_MAX || '0.1'),
+    DISTRIB_TOPUP_ETH: parseFloat(raw.DISTRIB_TOPUP_ETH || '0.0001'),
+    BYPASS_POLLING: raw.BYPASS_POLLING === 'true',
+    POLLING_TIMEOUT_MS: parseInt(raw.POLLING_TIMEOUT_MS || '300000'),
+    POLLING_INTERVAL_MS: parseInt(raw.POLLING_INTERVAL_MS || '10000'),
   };
 };
 
@@ -141,6 +194,7 @@ export const CONSTANTS = {
   CHAIN_IDS: {
     BASE: cfg.BASE_CHAIN_ID,
     ABSTRACT: cfg.ABSTRACT_CHAIN_ID,
+    ARBITRUM: 42161, // Arbitrum One
   },
   
   // Adresses natives

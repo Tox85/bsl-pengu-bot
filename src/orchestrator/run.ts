@@ -14,8 +14,11 @@ import { buildContext, type BotContext } from '../core/context.js';
 import { stateManager } from './state.js';
 import { MAX_UINT128 } from '../config/nums.js';
 import { CollectStatus } from '../core/collect-status.js';
+import { WalletManager } from '../core/wallet-manager.js';
+import { createMultiWalletOrchestrator, type MultiWalletOrchestratorConfig } from './multi-wallet-orchestrator.js';
 import type { 
   OrchestratorParams, 
+  OrchestratorDirectParams,
   OrchestratorResult, 
   OrchestratorState,
   OrchestratorMetrics 
@@ -30,8 +33,150 @@ export class OrchestratorService {
     this.stateManager = stateManager;
   }
 
-  // Exécuter le flow complet
+  /**
+   * Déterminer si on doit utiliser le mode multi-wallet
+   */
+  private shouldUseMultiWallet(): boolean {
+    return !!(
+      cfg.MNEMONIC && 
+      cfg.BYBIT_API_KEY && 
+      cfg.BYBIT_API_SECRET && 
+      cfg.HUB_WALLET_PRIVATE_KEY
+    );
+  }
+
+  // Exécuter le flow complet (single-wallet ou multi-wallet)
   async run(params: OrchestratorParams): Promise<OrchestratorResult> {
+    // Vérifier si on est en mode multi-wallet
+    if (this.shouldUseMultiWallet()) {
+      return await this.runMultiWallet(params);
+    }
+    
+    // Mode single-wallet (comportement original)
+    return await this.runSingleWallet(params);
+  }
+
+  // Exécuter le flow multi-wallet
+  private async runMultiWallet(params: OrchestratorParams): Promise<OrchestratorResult> {
+    const startTime = Date.now();
+    
+    try {
+      logger.info({
+        walletCount: cfg.WALLET_COUNT,
+        message: 'Démarrage du mode multi-wallet'
+      });
+
+      // Configuration de distribution
+      const distributionConfig: any = {
+        bybit: {
+          apiKey: cfg.BYBIT_API_KEY!,
+          apiSecret: cfg.BYBIT_API_SECRET!,
+          sandbox: cfg.BYBIT_SANDBOX,
+          testnet: cfg.BYBIT_TESTNET,
+        },
+        hubWalletPrivateKey: cfg.HUB_WALLET_PRIVATE_KEY!,
+        tokens: {
+          usdc: {
+            amountPerWallet: cfg.DISTRIBUTION_USDC_PER_WALLET,
+            totalAmount: cfg.DISTRIBUTION_USDC_PER_WALLET * cfg.WALLET_COUNT,
+          },
+          eth: {
+            amountPerWallet: cfg.DISTRIBUTION_ETH_PER_WALLET,
+            totalAmount: cfg.DISTRIBUTION_ETH_PER_WALLET * cfg.WALLET_COUNT,
+          },
+        },
+        walletCount: cfg.WALLET_COUNT,
+        randomizeAmounts: cfg.DISTRIBUTION_RANDOMIZE_AMOUNTS,
+        minAmountVariation: cfg.DISTRIBUTION_VARIATION_PERCENT / 100,
+        chainId: CONSTANTS.CHAIN_IDS.ABSTRACT,
+        batchSize: 10,
+      };
+
+      // Configuration de l'orchestrateur multi-wallet
+      const multiWalletConfig: MultiWalletOrchestratorConfig = {
+        distributionConfig,
+        walletCount: cfg.WALLET_COUNT,
+        mnemonic: cfg.MNEMONIC!,
+        sequential: true, // Commencer par séquentiel pour la stabilité
+        maxConcurrentWallets: 5,
+        defiParams: {
+          bridgeAmount: params.bridgeAmount,
+          bridgeToken: params.bridgeToken,
+          swapAmount: params.swapAmount,
+          swapPair: params.swapPair,
+          lpRangePercent: params.lpRangePercent,
+          collectAfterMinutes: params.collectAfterMinutes,
+          dryRun: params.dryRun,
+          autoGasTopUp: params.autoGasTopUp,
+          minNativeOnDest: params.minNativeOnDest,
+          gasTopUpTarget: params.gasTopUpTarget,
+          routerOverride: params.routerOverride,
+          npmOverride: params.npmOverride,
+          factoryOverride: params.factoryOverride,
+          autoTokenTopUp: params.autoTokenTopUp,
+          tokenTopUpSafetyBps: params.tokenTopUpSafetyBps,
+          tokenTopUpMin: params.tokenTopUpMin,
+          tokenTopUpSourceChainId: params.tokenTopUpSourceChainId,
+          tokenTopUpMaxWaitSec: params.tokenTopUpMaxWaitSec,
+          swapEngine: params.swapEngine,
+        },
+      };
+
+      // Créer et exécuter l'orchestrateur multi-wallet
+      const multiWalletOrchestrator = createMultiWalletOrchestrator(multiWalletConfig);
+      const multiWalletResult = await multiWalletOrchestrator.execute();
+
+      // Convertir le résultat multi-wallet en format OrchestratorResult
+      const result: OrchestratorResult = {
+        success: multiWalletResult.success,
+        state: {
+          wallet: `multi-wallet-${cfg.WALLET_COUNT}`,
+          currentStep: multiWalletResult.success ? OrchestratorStep.COLLECT_DONE : OrchestratorStep.ERROR,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        metrics: {
+          totalFeesCollected: { token0: '', amount0: 0n, token1: '', amount1: 0n },
+          totalGasUsed: 0n,
+          totalDuration: Date.now() - startTime,
+          pnl: { token0: 0n, token1: 0n },
+        },
+      };
+
+      if (!multiWalletResult.success) {
+        result.error = `Multi-wallet failed: ${multiWalletResult.errors.join(', ')}`;
+      }
+
+      logger.info({
+        totalWallets: multiWalletResult.totalWallets,
+        successfulWallets: multiWalletResult.successfulWallets,
+        failedWallets: multiWalletResult.failedWallets,
+        duration: Date.now() - startTime,
+        message: 'Mode multi-wallet terminé'
+      });
+
+      return result;
+
+    } catch (error) {
+      logError(error, { 
+        message: 'Erreur dans le mode multi-wallet'
+      });
+
+      return {
+        success: false,
+        state: {
+          wallet: 'multi-wallet',
+          currentStep: OrchestratorStep.ERROR,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  // Exécuter le flow single-wallet (comportement original)
+  private async runSingleWallet(params: OrchestratorParams): Promise<OrchestratorResult> {
     const startTime = Date.now();
     
     try {
@@ -192,7 +337,6 @@ export class OrchestratorService {
           return {
             ...state,
             currentStep: OrchestratorStep.BRIDGE_DONE,
-            bridgeTxHash: 'auto-topup',
             updatedAt: Date.now()
           };
         }
@@ -225,7 +369,6 @@ export class OrchestratorService {
         return {
           ...state,
           currentStep: OrchestratorStep.BRIDGE_DONE,
-          bridgeTxHash: 'skipped',
           updatedAt: Date.now()
         };
       }
@@ -234,7 +377,7 @@ export class OrchestratorService {
       const route = await bridgeService.getBridgeRoute(bridgeParams);
 
       // Vérifier le montant minimum USD
-      const fromUsd = route.estimate?.fromAmountUSD || parseFloat(params.bridgeAmount); // Fallback sur bridgeAmount
+      const fromUsd = parseFloat(route.fromAmount) / Math.pow(10, route.fromToken.decimals) || parseFloat(params.bridgeAmount); // Fallback sur bridgeAmount
       const minBridgeUsd = Number(process.env.MIN_BRIDGE_USD || 1);
       
       logger.info({
@@ -369,7 +512,7 @@ export class OrchestratorService {
               message: 'Bridge USDC auto top-up reçu (reprise)'
             });
           } else if (status.status === 'FAILED') {
-            throw new Error(`Bridge USDC auto top-up échoué (reprise): ${status.error}`);
+            throw new Error(`Bridge USDC auto top-up échoué (reprise): ${status.status}`);
           }
         }
 
@@ -508,6 +651,7 @@ export class OrchestratorService {
           message: 'Approbation requise'
         });
 
+        const baseSigner = createSigner(params.privateKey, context.tokenTopUpSourceChainId);
         await bridgeService.executeApproval(
           CONSTANTS.TOKENS.USDC[context.tokenTopUpSourceChainId],
           route.transactionRequest.to,
@@ -528,11 +672,11 @@ export class OrchestratorService {
         message: 'Exécution transaction bridge Li.Fi'
       });
 
-      const bridgeTx = await bridgeService.executeRoute({
-        route: route,
-        privateKey: params.privateKey,
-        fromChainId: context.tokenTopUpSourceChainId
-      });
+      const bridgeTx = await bridgeService.executeRoute(
+        route,
+        params.privateKey,
+        { dryRun: false }
+      );
 
       logger.info({
         txHash: bridgeTx.txHash,
@@ -559,7 +703,7 @@ export class OrchestratorService {
             message: 'Bridge USDC auto top-up reçu'
           });
         } else if (status.status === 'FAILED') {
-          throw new Error(`Bridge USDC auto top-up échoué: ${status.error}`);
+          throw new Error(`Bridge USDC auto top-up échoué: ${status.status}`);
         }
       }
 
@@ -1265,6 +1409,390 @@ export class OrchestratorService {
 
     return metrics;
   }
+
+  // Exécuter le mode direct (LP → Collect sans bridge/swap)
+  async runDirect(params: OrchestratorDirectParams): Promise<OrchestratorResult> {
+    const startTime = Date.now();
+    
+    try {
+      // Créer le contexte centralisé
+      const context = buildContext({
+        privateKey: params.privateKey,
+        autoGasTopUp: params.autoGasTopUp,
+        fresh: false,
+        dryRun: params.dryRun,
+        minNativeOnDest: params.minNativeOnDest,
+        gasTopUpTarget: params.gasTopUpTarget,
+      });
+
+      // Créer le signer pour obtenir l'adresse du wallet
+      const signer = await createSigner(params.privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const wallet = await signer.getAddress();
+
+      logger.info({
+        wallet,
+        signer: wallet,
+        dryRun: params.dryRun,
+        pair: params.pair,
+        amount0: params.amount0,
+        amount1: params.amount1,
+        rangePercent: params.rangePercent,
+        collectAfterMinutes: params.collectAfterMinutes,
+        autoGasTopUp: params.autoGasTopUp,
+        message: 'Démarrage du mode LP direct'
+      });
+
+      // Charger ou créer l'état
+      let state = this.stateManager.loadState(wallet);
+      if (!state) {
+        state = this.stateManager.createState(wallet);
+        logger.info({
+          wallet,
+          message: 'Nouvel état créé pour le mode direct'
+        });
+      }
+
+      // Vérifier les connexions RPC
+      const baseProvider = getProvider(CONSTANTS.CHAIN_IDS.BASE);
+      const abstractProvider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+      
+      const [baseConnected, abstractConnected] = await Promise.all([
+        withRetryRpc(async () => {
+          await baseProvider.getBlockNumber();
+          return true;
+        }),
+        withRetryRpc(async () => {
+          await abstractProvider.getBlockNumber();
+          return true;
+        })
+      ]);
+
+      logger.info({
+        base: baseConnected,
+        abstract: abstractConnected,
+        message: 'Connexions RPC vérifiées'
+      });
+
+      // Exécuter l'étape LP direct
+      state = await this.executeDirectLpStep(state, params, context);
+
+      // Exécuter l'étape collecte directe
+      state = await this.executeDirectCollectStep(state, params, context);
+
+      // Calculer les métriques
+      const metrics = this.calculateDirectMetrics(state, startTime);
+
+      logger.info({
+        wallet,
+        currentStep: state.currentStep,
+        totalDuration: metrics.totalDuration,
+        message: 'Mode LP direct terminé avec succès'
+      });
+
+      return {
+        success: true,
+        state,
+        metrics,
+      };
+
+    } catch (error) {
+      logError(error, { 
+        pair: params.pair,
+        amount0: params.amount0,
+        amount1: params.amount1,
+      });
+      
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        state: {
+          wallet: '',
+          currentStep: OrchestratorStep.ERROR,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      };
+    }
+  }
+
+  // Exécuter l'étape LP directe
+  private async executeDirectLpStep(
+    state: OrchestratorState,
+    params: OrchestratorDirectParams,
+    context: BotContext
+  ): Promise<OrchestratorState> {
+    try {
+      logger.info({
+        wallet: state.wallet,
+        message: 'Exécution de l\'étape LP directe'
+      });
+
+      // Mettre à jour l'état
+      state = this.stateManager.updateState(state, { currentStep: OrchestratorStep.DIRECT_LP_PENDING });
+
+      // Déterminer les tokens depuis la paire
+      const { token0, token1 } = this.getPairTokens(params.pair);
+
+      // Obtenir les informations du pool via le pool discovery service
+      const { poolDiscoveryService } = await import('../dex/pools.js');
+      const pools = await poolDiscoveryService.getAllPools({
+        tokenA: token0,
+        tokenB: token1,
+        feeTiers: params.fee ? [params.fee] : CONSTANTS.UNIV3.FEE_TIERS,
+      });
+
+      if (pools.length === 0) {
+        throw new Error(`Aucun pool trouvé pour la paire ${params.pair}`);
+      }
+
+      const pool = pools[0]; // Prendre le premier pool (le plus liquide)
+
+      // Calculer le range de ticks
+      const { tickLower, tickUpper } = liquidityPositionService.calculateTickRange({
+        currentTick: pool.tick,
+        tickSpacing: pool.tickSpacing,
+        rangePercent: parseFloat(params.rangePercent.toString()),
+      });
+
+      // Convertir les montants en wei
+      const amount0Desired = parseAmount(params.amount0, 6); // USDC a 6 décimales
+      const amount1Desired = parseAmount(params.amount1, 18); // PENGU a 18 décimales
+
+      // Vérifier les balances
+      const signer = await createSigner(params.privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const balance0 = await this.getTokenBalance(token0, signer.address, signer);
+      const balance1 = await this.getTokenBalance(token1, signer.address, signer);
+
+      logger.info({
+        token0,
+        token1,
+        balance0: formatAmount(balance0, 6),
+        balance1: formatAmount(balance1, 18),
+        amount0Desired: formatAmount(amount0Desired, 6),
+        amount1Desired: formatAmount(amount1Desired, 18),
+        message: 'Vérification des balances'
+      });
+
+      // Ajuster les montants selon les balances disponibles
+      const finalAmount0 = balance0 < amount0Desired ? balance0 : amount0Desired;
+      const finalAmount1 = balance1 < amount1Desired ? balance1 : amount1Desired;
+
+      if (finalAmount0 === 0n && finalAmount1 === 0n) {
+        throw new Error('Solde insuffisant pour les deux tokens');
+      }
+
+      // Créer la position LP
+      const result = await liquidityPositionService.createPosition({
+        token0,
+        token1,
+        fee: pool.fee,
+        tickLower,
+        tickUpper,
+        amount0Desired: finalAmount0,
+        amount1Desired: finalAmount1,
+        amount0Min: 0n,
+        amount1Min: 0n,
+        recipient: signer.address,
+        deadline: Math.floor(Date.now() / 1000) + 600, // 10 minutes
+      }, params.privateKey, {
+        dryRun: context.dryRun,
+      });
+
+      if (!result.success) {
+        throw new Error(`Création de position LP échouée: ${result.error}`);
+      }
+
+      // Mettre à jour l'état avec le résultat
+      state = this.stateManager.updateState(state, {
+        currentStep: OrchestratorStep.DIRECT_LP_DONE,
+        positionResult: {
+          tokenId: result.tokenId!,
+          token0,
+          token1,
+          tickLower,
+          tickUpper,
+          liquidity: result.liquidity!,
+          amount0: result.amount0!,
+          amount1: result.amount1!,
+          txHash: result.txHash!,
+          success: true,
+        },
+      });
+
+      logger.info({
+        wallet: state.wallet,
+        tokenId: result.tokenId?.toString(),
+        amount0: result.amount0?.toString(),
+        amount1: result.amount1?.toString(),
+        liquidity: result.liquidity?.toString(),
+        txHash: result.txHash,
+        message: 'Position LP directe créée avec succès'
+      });
+
+      return state;
+
+    } catch (error) {
+      logError(error, { pair: params.pair });
+      
+      return this.stateManager.updateState(state, {
+        currentStep: OrchestratorStep.ERROR,
+      });
+    }
+  }
+
+  // Exécuter l'étape de collecte directe
+  private async executeDirectCollectStep(
+    state: OrchestratorState,
+    params: OrchestratorDirectParams,
+    context: BotContext
+  ): Promise<OrchestratorState> {
+    try {
+      logger.info({
+        wallet: state.wallet,
+        message: 'Exécution de l\'étape Collect directe'
+      });
+
+      // Mettre à jour l'état
+      state = this.stateManager.updateState(state, { currentStep: OrchestratorStep.DIRECT_COLLECT_PENDING });
+
+      // Attendre le délai spécifié
+      if (!context.dryRun) {
+        const waitTime = params.collectAfterMinutes * 60 * 1000; // Convertir en ms
+        logger.info({
+          wallet: state.wallet,
+          waitTime: params.collectAfterMinutes,
+          message: 'Attente avant collecte des frais (mode direct)'
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+
+      // Obtenir le tokenId de la position
+      const tokenId = state.positionResult?.tokenId;
+      
+      if (!context.dryRun && !tokenId) {
+        throw new Error('TokenId de position non trouvé dans l\'état');
+      }
+
+      // Préparer les paramètres de collecte
+      const collectParams = {
+        tokenId: context.dryRun ? 0n : tokenId!,
+        recipient: state.wallet,
+        amount0Max: MAX_UINT128,
+        amount1Max: MAX_UINT128,
+      };
+
+      // Collecter les frais
+      const result = await liquidityPositionService.collectFees(collectParams, params.privateKey, {
+        dryRun: context.dryRun,
+      });
+
+      if (result.executed) {
+        // Mettre à jour l'état avec le résultat de collecte
+        state = this.stateManager.updateState(state, {
+          currentStep: OrchestratorStep.DIRECT_COLLECT_DONE,
+          collectResult: {
+            tokenId: tokenId!,
+            token0: state.positionResult!.token0,
+            token1: state.positionResult!.token1,
+            tickLower: state.positionResult!.tickLower,
+            tickUpper: state.positionResult!.tickUpper,
+            liquidity: 0n,
+            amount0: result.amount0,
+            amount1: result.amount1,
+            txHash: result.txHash || '',
+            success: true,
+            gasUsed: result.gasUsed?.toString(),
+          },
+        });
+
+        logger.info({
+          wallet: state.wallet,
+          tokenId: tokenId?.toString(),
+          amount0: result.amount0.toString(),
+          amount1: result.amount1.toString(),
+          txHash: result.txHash,
+          message: 'Collecte des frais directe terminée avec succès'
+        });
+      } else {
+        // Aucune collecte effectuée (pas de frais disponibles)
+        state = this.stateManager.updateState(state, {
+          currentStep: OrchestratorStep.DIRECT_COLLECT_DONE,
+        });
+
+        logger.info({
+          wallet: state.wallet,
+          tokenId: tokenId?.toString(),
+          status: result.status,
+          message: 'Aucune collecte de frais nécessaire'
+        });
+      }
+
+      return state;
+
+    } catch (error) {
+      logError(error, { 
+        tokenId: state.positionResult?.tokenId?.toString(),
+      });
+      
+      return this.stateManager.updateState(state, {
+        currentStep: OrchestratorStep.ERROR,
+      });
+    }
+  }
+
+  // Calculer les métriques pour le mode direct
+  private calculateDirectMetrics(state: OrchestratorState, startTime: number): OrchestratorMetrics {
+    const totalDuration = Date.now() - startTime;
+    
+    // Calculer les frais collectés
+    const totalFeesCollected = {
+      token0: state.positionResult?.token0 || '',
+      amount0: state.collectResult?.amount0 || 0n,
+      token1: state.positionResult?.token1 || '',
+      amount1: state.collectResult?.amount1 || 0n,
+    };
+
+    // Calculer le PnL (simplifié pour le mode direct)
+    const pnl = {
+      token0: totalFeesCollected.amount0,
+      token1: totalFeesCollected.amount1,
+    };
+
+    return {
+      totalFeesCollected,
+      totalGasUsed: 0n, // TODO: Calculer le gas total utilisé
+      totalDuration,
+      pnl,
+    };
+  }
+
+  // Fonction utilitaire pour obtenir les tokens d'une paire
+  private getPairTokens(pair: string): { token0: string; token1: string } {
+    const [token0Symbol, token1Symbol] = pair.split('/');
+    
+    const token0 = this.getTokenAddress(token0Symbol);
+    const token1 = this.getTokenAddress(token1Symbol);
+    
+    return { token0, token1 };
+  }
+
+  // Fonction utilitaire pour obtenir l'adresse d'un token
+  private getTokenAddress(token: string): string {
+    switch (token.toUpperCase()) {
+      case 'PENGU':
+        return CONSTANTS.TOKENS.PENGU;
+      case 'USDC':
+        return CONSTANTS.TOKENS.USDC;
+      case 'ETH':
+        return CONSTANTS.NATIVE_ADDRESS;
+      case 'WETH':
+        return CONSTANTS.TOKENS.WETH;
+      default:
+        throw new Error(`Token non supporté: ${token}`);
+    }
+  }
+
 }
 
 // Instance singleton de l'orchestrateur

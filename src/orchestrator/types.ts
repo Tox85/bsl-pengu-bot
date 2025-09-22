@@ -32,6 +32,11 @@ export enum OrchestratorStep {
   LP_DONE = 'lp_done',
   COLLECT_PENDING = 'collect_pending',
   COLLECT_DONE = 'collect_done',
+  // Étapes pour le mode direct
+  DIRECT_LP_PENDING = 'direct_lp_pending',
+  DIRECT_LP_DONE = 'direct_lp_done',
+  DIRECT_COLLECT_PENDING = 'direct_collect_pending',
+  DIRECT_COLLECT_DONE = 'direct_collect_done',
   ERROR = 'error',
 }
 
@@ -61,6 +66,23 @@ export interface OrchestratorParams {
   tokenTopUpMin?: string;
   tokenTopUpSourceChainId?: number;
   tokenTopUpMaxWaitSec?: number;
+}
+
+// Types pour les paramètres du mode direct
+export interface OrchestratorDirectParams {
+  privateKey: string;
+  pair: 'PENGU/ETH' | 'PENGU/USDC';
+  amount0: string;
+  amount1: string;
+  rangePercent: number;
+  collectAfterMinutes: number;
+  dryRun?: boolean;
+  // Options de gas
+  autoGasTopUp?: boolean;
+  minNativeOnDest?: string;
+  gasTopUpTarget?: string;
+  // Options de pool
+  fee?: number;
 }
 
 // Types pour les résultats de l'orchestrateur
