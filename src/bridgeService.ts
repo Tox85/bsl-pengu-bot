@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { JsonRpcProvider, Wallet } from 'ethers';
+import { Contract, JsonRpcProvider, Wallet } from 'ethers';
 import type { TransactionRequest } from 'ethers';
 import { NETWORKS, env } from './config.js';
 import type { BridgeQuote, ExecutionResult } from './types.js';
@@ -8,13 +8,22 @@ import { logger } from './logger.js';
 
 const LIFI_BASE_URL = 'https://li.quest/v1';
 const LIFI_NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const ERC20_ABI = ['function balanceOf(address owner) view returns (uint256)'];
+const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 
 export class BridgeService {
   private readonly provider: JsonRpcProvider;
+  private readonly destinationProvider: JsonRpcProvider;
   private readonly signer: Wallet;
+  private readonly destinationTokenCache = new Map<string, Contract>();
 
   constructor(privateKey: string) {
     this.provider = new JsonRpcProvider(NETWORKS.base.rpcUrl, NETWORKS.base.chainId);
+    this.destinationProvider = new JsonRpcProvider(
+      NETWORKS.abstract.rpcUrl,
+      NETWORKS.abstract.chainId,
+    );
     this.signer = new Wallet(privateKey, this.provider);
   }
 
@@ -78,10 +87,11 @@ export class BridgeService {
 
   async executeBridge(quote: BridgeQuote): Promise<ExecutionResult<void>> {
     try {
+      const value = quote.txValueWei ?? quote.amountWei;
       const txRequest: TransactionRequest = {
         to: quote.txTarget,
         data: quote.txData,
-        value: quote.txValueWei ?? quote.amountWei,
+        value,
       };
       if (quote.gasLimit) {
         txRequest.gasLimit = quote.gasLimit;
@@ -98,5 +108,39 @@ export class BridgeService {
       logger.error({ err: error }, 'Bridge transaction failed');
       return { success: false, error: error as Error };
     }
+  }
+
+  async getDestinationTokenBalance(tokenAddress: string): Promise<bigint> {
+    if (!tokenAddress || tokenAddress.toLowerCase() === LIFI_NATIVE_TOKEN.toLowerCase()) {
+      return this.destinationProvider.getBalance(this.signer.address);
+    }
+
+    const address = tokenAddress.toLowerCase();
+    let contract = this.destinationTokenCache.get(address);
+    if (!contract) {
+      contract = new Contract(tokenAddress, ERC20_ABI, this.destinationProvider);
+      this.destinationTokenCache.set(address, contract);
+    }
+    const balance = await contract.balanceOf(this.signer.address);
+    return balance.toBigInt();
+  }
+
+  async waitForDestinationFunds(
+    tokenAddress: string,
+    startingBalance: bigint,
+    minimumIncreaseWei: bigint,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  ): Promise<boolean> {
+    if (minimumIncreaseWei <= 0n) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const current = await this.getDestinationTokenBalance(tokenAddress);
+      if (current >= startingBalance + minimumIncreaseWei) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+    return false;
   }
 }

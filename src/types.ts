@@ -35,6 +35,7 @@ export type SwapQuote = {
   calldata: string;
   target: AddressLike;
   valueWei: bigint;
+  allowanceTarget?: string;
 };
 
 export type LiquidityPosition = {

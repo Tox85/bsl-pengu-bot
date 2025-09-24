@@ -58,6 +58,7 @@ export class StrategyRunner {
   async executeCycle(): Promise<StrategyReport> {
     const withdrawAmountWei = toWei(env.HUB_WITHDRAW_AMOUNT);
     const gasPrice = weiFromGwei(env.GAS_PRICE_GWEI);
+    const bridgeGasBufferWei = gasPrice * 300_000n;
 
     logger.info('Starting strategy cycle');
 
@@ -88,21 +89,46 @@ export class StrategyRunner {
     }
     const hubBalance = await this.walletHub.getHubBalance();
     const plan = this.walletHub.createDistributionPlan(hubBalance);
-    summary.distribution.fundedWallets = plan.filter((item) => item.amountWei > 0n).length;
-    summary.distribution.totalWei = plan.reduce((total, item) => total + item.amountWei, 0n);
+    const distributionResult = await this.walletHub.executeDistribution(plan, gasPrice);
+    if (distributionResult.success && distributionResult.data) {
+      summary.distribution.fundedWallets = distributionResult.data.fundedCount;
+      summary.distribution.totalWei = distributionResult.data.totalWei;
+    } else {
+      summary.distribution.fundedWallets = plan.filter((item) => item.amountWei > 0n).length;
+      summary.distribution.totalWei = plan.reduce((total, item) => total + item.amountWei, 0n);
+    }
     summary.funding.confirmedWei = summary.distribution.totalWei;
-    await this.walletHub.executeDistribution(plan, gasPrice);
 
     let bridgeExecuted = false;
     const strategyAllocation = plan[0]?.amountWei ?? 0n;
-    if (strategyAllocation > 0n) {
-      const quote = await this.bridge.fetchQuote(strategyAllocation);
+    const bridgeableAmount = strategyAllocation > bridgeGasBufferWei ? strategyAllocation - bridgeGasBufferWei : 0n;
+    if (bridgeableAmount > 0n) {
+      const quote = await this.bridge.fetchQuote(bridgeableAmount);
+      const destinationBalanceBefore = await this.bridge.getDestinationTokenBalance(quote.toToken);
       const result = await this.bridge.executeBridge(quote);
-      bridgeExecuted = result.success;
+      if (result.success) {
+        const arrived = await this.bridge.waitForDestinationFunds(
+          quote.toToken,
+          destinationBalanceBefore,
+          quote.minAmountOutWei,
+        );
+        bridgeExecuted = arrived;
+        if (!arrived) {
+          logger.warn(
+            {
+              routeId: quote.routeId,
+              minAmountOut: fromWei(quote.minAmountOutWei),
+            },
+            'Bridge transaction confirmed but funds not detected within timeout',
+          );
+        }
+      }
+    } else if (strategyAllocation > 0n) {
+      logger.warn('Strategy allocation insufficient to cover bridge gas buffer; skipping bridge');
     }
     summary.bridge.executed = bridgeExecuted;
-    summary.bridge.amountWei = strategyAllocation;
-    if (!bridgeExecuted && strategyAllocation === 0n) {
+    summary.bridge.amountWei = bridgeableAmount;
+    if (!bridgeExecuted && bridgeableAmount === 0n) {
       logger.warn('Strategy wallet received no new funds; proceeding with existing balances');
     }
 
