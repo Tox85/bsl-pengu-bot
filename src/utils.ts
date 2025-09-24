@@ -27,7 +27,7 @@ export const differencePercent = (a: bigint, b: bigint): number => {
 };
 
 export const weiFromGwei = (gwei: number): bigint => {
-  return BigInt(Math.round(gwei * 1e9)) * 1_000_000_000n;
+  return BigInt(Math.round(gwei * 1e9));
 };
 
 export const scaleByPercent = (value: bigint, fraction: number): bigint => {
@@ -35,3 +35,7 @@ export const scaleByPercent = (value: bigint, fraction: number): bigint => {
   const scaled = Math.round(fraction * 10000);
   return (value * BigInt(scaled)) / 10000n;
 };
+
+// Helpers recommandés
+export const percentBps = (bps: number): number => bps / 10_000;
+export const nowPlusSecs = (secs = 300) => Math.floor(Date.now() / 1000) + secs;

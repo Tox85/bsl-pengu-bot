@@ -20,7 +20,7 @@ const envSchema = z.object({
   PENGU_TOKEN_ADDRESS: z.string().startsWith('0x'),
   WRAPPED_ETH_ADDRESS: z.string().startsWith('0x'),
   UNISWAP_ROUTER_ADDRESS: z.string().startsWith('0x'),
-  UNISWAP_PAIR_ADDRESS: z.string().startsWith('0x'),
+  UNISWAP_PAIR_ADDRESS: z.string().optional(),
   REBALANCE_PRICE_THRESHOLD_PERCENT: z.coerce.number().min(5).max(50),
   FEE_GAS_MULTIPLE_TRIGGER: z.coerce.number().min(1).max(10),
   PENGU_TO_ETH_FEE_SWAP_PERCENT: z.coerce.number().min(0).max(100).default(30),

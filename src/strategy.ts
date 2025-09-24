@@ -3,6 +3,8 @@ import { WalletHub } from './walletHub.js';
 import { BridgeService } from './bridgeService.js';
 import { SwapService } from './swapService.js';
 import { LPManager } from './lpManager.js';
+import { SimpleLpService } from './simpleLpService.js';
+import { RealLpService } from './realLpService.js';
 import { FeeManager } from './feeManager.js';
 import { ensureWalletState } from './walletStore.js';
 import { env, STRATEGY_CONSTANTS, TOKENS } from './config.js';
@@ -47,6 +49,8 @@ export class StrategyRunner {
   private readonly bridge = new BridgeService(this.strategyWallet.privateKey);
   private readonly swap = new SwapService(this.strategyWallet.privateKey);
   private readonly lpManager = new LPManager(this.strategyWallet.privateKey);
+  private readonly simpleLp = new SimpleLpService(this.strategyWallet.privateKey);
+  private readonly realLp = new RealLpService(this.strategyWallet.privateKey);
   private readonly feeManager = new FeeManager(this.swap);
   private position: LiquidityPosition | null = null;
   private latestSummary: CycleLogSummary | null = null;
@@ -98,10 +102,13 @@ export class StrategyRunner {
     
     // Vérifier d'abord les fonds existants sur Abstract
     const existingBalances = await this.swap.getTokenBalances();
-    if (existingBalances.ethWei > 0n) {
+    const minExistingAmount = toWei(0.001); // Minimum 0.001 ETH pour considérer les fonds comme suffisants
+    
+    if (existingBalances.ethWei >= minExistingAmount) {
       logger.info({ 
         existingEth: fromWei(existingBalances.ethWei),
-        message: 'Fonds existants détectés sur Abstract, bridge non nécessaire'
+        minimum: fromWei(minExistingAmount),
+        message: 'Fonds suffisants détectés sur Abstract, bridge non nécessaire'
       });
       bridgeExecuted = true; // Considérer comme "réussi" car on a déjà des fonds
       bridgeAmountWei = existingBalances.ethWei;
@@ -206,20 +213,61 @@ export class StrategyRunner {
     // Calculer le montant minimum pour un swap viable (inclut les frais de gas)
     const minSwapAmount = gasPrice * 100000n; // Réserve réduite pour les frais de gas futurs
     
-    if (balancesBeforeSwap.ethWei > 0n) {
-      const halfEth = balancesBeforeSwap.ethWei / 2n;
-      // Essayer le swap même avec des montants faibles
-      if (halfEth > 0n) {
+    // Utiliser les fonds disponibles (ETH + WETH)
+    const totalAvailableEth = balancesBeforeSwap.ethWei + balancesBeforeSwap.wethWei;
+    
+    if (totalAvailableEth > 0n) {
+      // Essayer de wrapper l'ETH disponible en WETH, mais laisser des frais de gas
+      if (balancesBeforeSwap.ethWei > 0n) {
+        const gasReserve = gasPrice * 100000n; // Réserve pour les frais de gas
+        const wrapAmount = balancesBeforeSwap.ethWei > gasReserve ? balancesBeforeSwap.ethWei - gasReserve : 0n;
+        
+        if (wrapAmount > 0n) {
+          try {
+            await this.swap.ensureWethBalance(wrapAmount, balancesBeforeSwap.nativeEthWei);
+            logger.info({ 
+              amount: fromWei(wrapAmount),
+              gasReserve: fromWei(gasReserve),
+              message: 'ETH wrappé en WETH avec succès'
+            });
+          } catch (error) {
+            logger.warn({ 
+              err: error,
+              message: 'Erreur lors du wrapping ETH, continuer avec WETH existant'
+            });
+          }
+        } else {
+          logger.info({ 
+            available: fromWei(balancesBeforeSwap.ethWei),
+            gasReserve: fromWei(gasReserve),
+            message: 'Montant insuffisant pour wrapper après réserve de gas'
+          });
+        }
+      }
+      
+      // Récupérer les nouveaux soldes après wrapping
+      const updatedBalances = await this.swap.getTokenBalances();
+      const wethAvailable = updatedBalances.wethWei;
+      
+      if (wethAvailable > 0n) {
+        // Utiliser la moitié du WETH disponible pour le swap
+        const halfWeth = wethAvailable / 2n;
+        
         try {
-          await this.swap.ensureWethBalance(halfEth, balancesBeforeSwap.nativeEthWei);
-          const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
+          logger.info({
+            wethAmount: fromWei(halfWeth),
+            message: 'Tentative de swap WETH → PENGU avec Universal Router'
+          });
+          
+          const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfWeth);
           const swapResult = await this.swap.executeSwap(quote);
           swapExecuted = swapResult.success;
           
           if (swapResult.success) {
             logger.info({ 
-              amount: fromWei(halfEth),
-              message: 'Swap ETH vers PENGU exécuté avec succès'
+              amount: fromWei(halfWeth),
+              txHash: swapResult.txHash,
+              message: 'Swap WETH vers PENGU exécuté avec succès'
             });
           } else {
             logger.warn({ 
@@ -236,14 +284,14 @@ export class StrategyRunner {
         }
       } else {
         logger.warn({ 
-          available: fromWei(balancesBeforeSwap.ethWei),
-          message: 'Montant insuffisant pour un swap'
+          wethAvailable: fromWei(wethAvailable),
+          message: 'Pas de WETH disponible pour le swap'
         });
       }
     } else {
       logger.warn({ 
-        available: fromWei(balancesBeforeSwap.ethWei),
-        message: 'Aucun fonds ETH disponible pour le swap'
+        totalAvailable: fromWei(totalAvailableEth),
+        message: 'Aucun fonds ETH/WETH disponible pour le swap'
       });
     }
 
@@ -272,34 +320,84 @@ export class StrategyRunner {
     let rebalance: StrategyReport['rebalance'] = { executed: false, reason: null };
 
     if (!this.position) {
-      const instruction = {
-        targetEthWei: scaleByPercent(availableWeth, STRATEGY_CONSTANTS.liquidityUtilizationPercent),
-        targetPenguWei: scaleByPercent(availablePengu, STRATEGY_CONSTANTS.liquidityUtilizationPercent),
-      };
+      // Utiliser le service LP réel Uniswap v3
+      const balances = await this.realLp.getTokenBalances();
       
-      // Vérifier que nous avons suffisamment de fonds pour créer une position LP
-      const minLpAmount = gasPrice * 200000n; // Minimum réduit pour une position LP viable
-      
-      if (instruction.targetEthWei > 0n && instruction.targetPenguWei > 0n) {
+      if (balances.wethWei > 0n && balances.penguWei > 0n) {
+        // Créer une vraie position LP avec les fonds disponibles
+        const wethAmount = balances.wethWei / 2n; // Utiliser la moitié du WETH
+        const penguAmount = balances.penguWei / 2n; // Utiliser la moitié du PENGU
+        
+        logger.info({
+          wethAmount: fromWei(wethAmount),
+          penguAmount: fromWei(penguAmount),
+          message: 'Tentative de création de vraie position LP Uniswap v3'
+        });
+        
         try {
-          this.position = await this.lpManager.createPosition(instruction, gasPrice);
-          logger.info({ 
-            ethAmount: fromWei(instruction.targetEthWei),
-            penguAmount: fromWei(instruction.targetPenguWei),
-            message: 'Position LP créée avec succès'
-          });
+          const result = await this.realLp.createRealLpPosition(wethAmount, penguAmount);
+          if (result.success) {
+            logger.info({ 
+              wethAmount: fromWei(wethAmount),
+              penguAmount: fromWei(penguAmount),
+              txHash: result.txHash,
+              tokenId: result.tokenId,
+              message: 'Vraie position LP Uniswap v3 créée avec succès'
+            });
+            this.position = { // Vraie position avec tokenId
+              id: `real-lp-position-${result.tokenId}`,
+              ethWei: wethAmount,
+              penguWei: penguAmount,
+              lastRebalance: now(),
+            };
+          } else {
+            logger.error({ 
+              error: result.error?.message,
+              message: 'Erreur lors de la création de la vraie position LP'
+            });
+          }
         } catch (error) {
           logger.error({ 
             err: error,
-            message: 'Erreur lors de la création de la position LP'
+            message: 'Erreur lors de la création de la vraie position LP'
           });
-          this.position = null;
+        }
+      } else if (balances.wethWei > 0n && balances.penguWei === 0n) {
+        // Pas de PENGU, essayer de swapper une partie du WETH
+        logger.info({
+          wethAvailable: fromWei(balances.wethWei),
+          message: 'Pas de PENGU, tentative de swap WETH → PENGU pour vraie LP'
+        });
+        
+        const swapAmount = balances.wethWei / 2n;
+        const swapResult = await this.simpleLp.swapWethToPengu(swapAmount);
+        
+        if (swapResult.success && swapResult.penguReceived) {
+          // Maintenant créer la vraie position LP avec WETH restant + PENGU reçu
+          const remainingWeth = balances.wethWei - swapAmount;
+          const result = await this.realLp.createRealLpPosition(remainingWeth, swapResult.penguReceived);
+          
+          if (result.success) {
+            logger.info({ 
+              wethAmount: fromWei(remainingWeth),
+              penguAmount: fromWei(swapResult.penguReceived),
+              txHash: result.txHash,
+              tokenId: result.tokenId,
+              message: 'Vraie position LP créée après swap avec succès'
+            });
+            this.position = {
+              id: `real-lp-position-after-swap-${result.tokenId}`,
+              ethWei: remainingWeth,
+              penguWei: swapResult.penguReceived,
+              lastRebalance: now(),
+            };
+          }
         }
       } else {
         logger.warn({ 
-          ethAmount: fromWei(instruction.targetEthWei),
-          penguAmount: fromWei(instruction.targetPenguWei),
-          message: 'Fonds insuffisants pour créer une position LP (besoin de ETH et PENGU)'
+          wethBalance: fromWei(balances.wethWei),
+          penguBalance: fromWei(balances.penguWei),
+          message: 'Fonds insuffisants pour créer une position LP (besoin de WETH et PENGU)'
         });
       }
     } else {

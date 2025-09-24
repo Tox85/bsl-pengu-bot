@@ -64,7 +64,7 @@ export class LPManager {
     this.provider = new JsonRpcProvider(NETWORKS.abstract.rpcUrl, NETWORKS.abstract.chainId);
     this.signer = new Wallet(privateKey, this.provider);
     this.router = new Contract(DEX.router, ROUTER_ABI, this.signer);
-    this.pair = new Contract(DEX.pair, PAIR_ABI, this.signer);
+    this.pair = DEX.pair ? new Contract(DEX.pair, PAIR_ABI, this.signer) : null;
     this.weth = new Contract(TOKENS.eth.address, WETH_ABI, this.signer);
     this.pengu = new Contract(TOKENS.pengu.address, ERC20_ABI, this.signer);
   }
