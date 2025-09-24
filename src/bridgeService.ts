@@ -1,11 +1,13 @@
 import axios from 'axios';
 import { JsonRpcProvider, Wallet } from 'ethers';
-import { NETWORKS, TOKENS, env } from './config.js';
+import type { TransactionRequest } from 'ethers';
+import { NETWORKS, env } from './config.js';
 import type { BridgeQuote, ExecutionResult } from './types.js';
 import { applySlippageBps } from './utils.js';
 import { logger } from './logger.js';
 
-const JUMPER_BASE_URL = 'https://api.jumper.exchange/v1';
+const LIFI_BASE_URL = 'https://li.quest/v1';
+const LIFI_NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 
 export class BridgeService {
   private readonly provider: JsonRpcProvider;
@@ -20,45 +22,75 @@ export class BridgeService {
     const params = {
       fromChain: NETWORKS.base.chainId,
       toChain: NETWORKS.abstract.chainId,
-      fromToken: TOKENS.eth.address,
-      toToken: TOKENS.eth.address,
-      amount: amountWei.toString(),
+      fromToken: LIFI_NATIVE_TOKEN,
+      toToken: LIFI_NATIVE_TOKEN,
+      fromAmount: amountWei.toString(),
       slippage: env.BRIDGE_SLIPPAGE_BPS / 100,
-      integratorId: 'bsl-pengu-bot',
+      fromAddress: this.signer.address,
+      toAddress: this.signer.address,
+      integrator: 'bsl-pengu-bot',
     } as const;
 
-    const { data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params });
-    const route = data?.routes?.[0];
-    if (!route) {
-      throw new Error('No bridge route available from Jumper');
+    const { data } = await axios.get(`${LIFI_BASE_URL}/quote`, { params });
+
+    if (!data?.transactionRequest) {
+      throw new Error('LiFi quote did not include transaction request');
     }
 
-    const tx = route.transactionRequest;
-    const minAmountOut = applySlippageBps(BigInt(route.estimate.toAmountMin ?? route.estimate.toAmount), env.BRIDGE_SLIPPAGE_BPS);
+    const minAmountRaw = data?.estimate?.toAmountMin ?? data?.estimate?.toAmount;
+    if (!minAmountRaw) {
+      throw new Error('LiFi quote missing minimum amount estimate');
+    }
+
+    const minAmountOut = applySlippageBps(BigInt(minAmountRaw), env.BRIDGE_SLIPPAGE_BPS);
+    const gasEstimate = (data?.estimate?.gasCosts ?? []).reduce<bigint>((total, cost) => {
+      try {
+        return total + BigInt(cost?.estimate ?? 0);
+      } catch (error) {
+        logger.warn({ err: error }, 'Failed to parse LiFi gas cost entry');
+        return total;
+      }
+    }, 0n);
+
+    const tx = data.transactionRequest;
+    const txValueWei = typeof tx.value === 'string' ? BigInt(tx.value) : undefined;
+    const gasLimit = typeof tx.gasLimit === 'string' ? BigInt(tx.gasLimit) : undefined;
+    const gasPriceWei = typeof tx.gasPrice === 'string' ? BigInt(tx.gasPrice) : undefined;
 
     const quote: BridgeQuote = {
       fromChainId: NETWORKS.base.chainId,
       toChainId: NETWORKS.abstract.chainId,
-      fromToken: TOKENS.eth.address,
-      toToken: TOKENS.eth.address,
+      fromToken: data?.action?.fromToken?.address ?? LIFI_NATIVE_TOKEN,
+      toToken: data?.action?.toToken?.address ?? LIFI_NATIVE_TOKEN,
       amountWei,
       minAmountOutWei: minAmountOut,
-      routeId: route.routeId,
+      routeId: data?.id ?? 'lifi-route',
       txData: tx.data,
       txTarget: tx.to,
-      gasEstimate: BigInt(route.estimate.gasCosts?.[0]?.estimate ?? 0),
+      gasEstimate,
+      txValueWei,
+      gasLimit,
+      gasPriceWei,
     };
-    logger.info({ routeId: quote.routeId }, 'Bridge quote received');
+    logger.info({ routeId: quote.routeId, tool: data?.tool }, 'LiFi bridge quote received');
     return quote;
   }
 
   async executeBridge(quote: BridgeQuote): Promise<ExecutionResult<void>> {
     try {
-      const tx = await this.signer.sendTransaction({
+      const txRequest: TransactionRequest = {
         to: quote.txTarget,
         data: quote.txData,
-        value: quote.amountWei,
-      });
+        value: quote.txValueWei ?? quote.amountWei,
+      };
+      if (quote.gasLimit) {
+        txRequest.gasLimit = quote.gasLimit;
+      }
+      if (quote.gasPriceWei) {
+        txRequest.gasPrice = quote.gasPriceWei;
+      }
+
+      const tx = await this.signer.sendTransaction(txRequest);
       logger.info({ txHash: tx.hash, routeId: quote.routeId }, 'Bridge transaction submitted');
       await tx.wait();
       return { success: true, txHash: tx.hash };

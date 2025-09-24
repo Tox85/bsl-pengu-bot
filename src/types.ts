@@ -22,6 +22,9 @@ export type BridgeQuote = {
   txData: string;
   txTarget: AddressLike;
   gasEstimate: bigint;
+  txValueWei?: bigint;
+  gasLimit?: bigint;
+  gasPriceWei?: bigint;
 };
 
 export type SwapQuote = {
