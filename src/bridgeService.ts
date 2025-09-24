@@ -16,7 +16,7 @@ export class BridgeService {
     this.signer = new Wallet(privateKey, this.provider);
   }
 
-  async fetchQuote(amountWei: bigint): Promise<BridgeQuote> {
+  async fetchQuote(amountWei: bigint): Promise<ExecutionResult<BridgeQuote>> {
     const params = {
       fromChain: NETWORKS.base.chainId,
       toChain: NETWORKS.abstract.chainId,
@@ -33,19 +33,24 @@ export class BridgeService {
     } catch (error) {
       if (axios.isAxiosError(error)) {
         const status = error.response?.status;
-        const detail = error.response?.data;
-        throw new Error(
-          `Unable to fetch bridge quote from Jumper (status: ${status ?? 'unknown'}): ${
-            typeof detail === 'string' ? detail : error.message
-          }`,
-        );
+        const detail =
+          typeof error.response?.data === 'string'
+            ? error.response.data
+            : JSON.stringify(error.response?.data ?? {});
+        const message = `Unable to fetch bridge quote from Jumper (status: ${status ?? 'unknown'}): ${
+          detail || error.message
+        }`;
+        return { success: false, error: new Error(message) };
       }
-      throw error;
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
     }
     const response = data as { routes?: Array<unknown> };
     const route = (response?.routes?.[0] ?? null) as Record<string, unknown> | null;
     if (!route) {
-      throw new Error('No bridge route available from Jumper');
+      return { success: false, error: new Error('No bridge route available from Jumper') };
     }
 
     const tx = route.transactionRequest as { data?: string; to?: string } | undefined;
@@ -53,10 +58,10 @@ export class BridgeService {
       | { toAmountMin?: string; toAmount?: string; gasCosts?: Array<{ estimate?: string }> }
       | undefined;
     if (!tx?.to || !tx.data) {
-      throw new Error('Bridge quote missing transaction request payload');
+      return { success: false, error: new Error('Bridge quote missing transaction request payload') };
     }
     if (!estimate?.toAmount) {
-      throw new Error('Bridge quote missing amount estimate');
+      return { success: false, error: new Error('Bridge quote missing amount estimate') };
     }
     const minAmountOut = applySlippageBps(
       BigInt((estimate.toAmountMin ?? estimate.toAmount) as string),
@@ -76,7 +81,7 @@ export class BridgeService {
       gasEstimate: BigInt(estimate.gasCosts?.[0]?.estimate ?? 0),
     };
     logger.info({ routeId: quote.routeId }, 'Bridge quote received');
-    return quote;
+    return { success: true, data: quote };
   }
 
   async executeBridge(quote: BridgeQuote): Promise<ExecutionResult<void>> {

@@ -6,6 +6,23 @@ import { logger } from './logger.js';
 import { fromWei } from './utils.js';
 
 const MIN_SATELLITE_TRANSFER_WEI = parseUnits('0.0002', 18);
+const MAX_GAS_RETRY_ATTEMPTS = 3;
+const GAS_PRICE_BUMP_BPS = 1_500n;
+
+const bumpGasPrice = (gasPriceWei: bigint): bigint => {
+  const increment = (gasPriceWei * GAS_PRICE_BUMP_BPS) / 10_000n;
+  return gasPriceWei + (increment > 0n ? increment : 1n);
+};
+
+const isReplacementUnderpriced = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') return false;
+  const typed = error as { code?: string; message?: string; info?: { error?: { message?: string } } };
+  if (typed.code === 'REPLACEMENT_UNDERPRICED') return true;
+  const message = typed.message?.toLowerCase() ?? '';
+  if (message.includes('replacement') && message.includes('underpriced')) return true;
+  const nestedMessage = typed.info?.error?.message?.toLowerCase() ?? '';
+  return nestedMessage.includes('replacement') && nestedMessage.includes('underpriced');
+};
 
 export class WalletHub {
   private readonly provider: JsonRpcProvider;
@@ -121,18 +138,40 @@ export class WalletHub {
 
     let fundedCount = 0;
     let totalWei = 0n;
+    let effectiveGasPrice = gasPriceWei;
     try {
       for (const item of plan) {
         if (item.amountWei === 0n) continue;
-        const tx = await this.hub.sendTransaction({
-          to: item.recipient.address,
-          value: item.amountWei,
-          gasPrice: gasPriceWei,
-        });
-        await tx.wait();
-        fundedCount += 1;
-        totalWei += item.amountWei;
-        logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+        let attempt = 0;
+        for (;;) {
+          try {
+            const tx = await this.hub.sendTransaction({
+              to: item.recipient.address,
+              value: item.amountWei,
+              gasPrice: effectiveGasPrice,
+            });
+            await tx.wait();
+            fundedCount += 1;
+            totalWei += item.amountWei;
+            logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+            break;
+          } catch (error) {
+            if (isReplacementUnderpriced(error) && attempt < MAX_GAS_RETRY_ATTEMPTS) {
+              attempt += 1;
+              effectiveGasPrice = bumpGasPrice(effectiveGasPrice);
+              logger.warn(
+                {
+                  attempt,
+                  bumpedGasPriceWei: effectiveGasPrice.toString(),
+                  recipient: item.recipient.address,
+                },
+                'Satellite funding replacement detected; retrying with higher gas price',
+              );
+              continue;
+            }
+            throw error;
+          }
+        }
       }
       if (fundedCount > 0) {
         logger.info(

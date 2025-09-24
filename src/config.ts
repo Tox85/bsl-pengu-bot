@@ -3,14 +3,16 @@ import { z } from 'zod';
 
 loadEnv();
 
-const envSchema = z.object({
+const envSchema = z
+  .object({
   BYBIT_API_KEY: z.string().optional(),
   BYBIT_API_SECRET: z.string().optional(),
   HUB_WITHDRAW_AMOUNT: z.coerce.number().positive(),
   HUB_WALLET_PASSWORD: z.string().min(12, 'Password must be at least 12 chars'),
   HUB_WALLET_STORE: z.string().default('./data/wallets.enc'),
-  HUB_WALLET_INDEX: z.coerce.number().int().min(0).max(99).default(0),
+  HUB_WALLET_INDEX: z.coerce.number().int().min(0).default(0),
   STRATEGY_MNEMONIC: z.string().min(12, 'Missing mnemonic for deterministic wallets'),
+  STRATEGY_WALLET_COUNT: z.coerce.number().int().min(2).max(500).default(100),
   BASE_FUNDING_PRIVATE_KEY: z.string().startsWith('0x').optional(),
   RPC_BASE: z.string().url(),
   RPC_ABSTRACT: z.string().url(),
@@ -30,7 +32,16 @@ const envSchema = z.object({
   CHAIN_ID_BASE: z.coerce.number(),
   CHAIN_ID_ABSTRACT: z.coerce.number(),
   GAS_PRICE_GWEI: z.coerce.number().positive().default(0.1),
-});
+})
+  .superRefine((data, ctx) => {
+    if (data.HUB_WALLET_INDEX >= data.STRATEGY_WALLET_COUNT) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['HUB_WALLET_INDEX'],
+        message: 'HUB_WALLET_INDEX must be lower than STRATEGY_WALLET_COUNT',
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema> & {
   BYBIT_API_KEY?: string;
@@ -54,7 +65,7 @@ if (env.SATELLITE_VARIANCE_MIN >= env.SATELLITE_VARIANCE_MAX) {
 }
 
 export const STRATEGY_CONSTANTS = {
-  walletCount: 100,
+  walletCount: env.STRATEGY_WALLET_COUNT,
   hubIndex: env.HUB_WALLET_INDEX,
   penguAllocation: 0.5,
   ethAllocation: 0.5,

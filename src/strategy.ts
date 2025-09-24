@@ -123,68 +123,83 @@ export class StrategyRunner {
     if (strategyAllocation > fallbackBridgeReserve) {
       const desiredBridgeAmount = strategyAllocation - fallbackBridgeReserve;
       if (desiredBridgeAmount > 0n) {
-        try {
-          let quote: BridgeQuote | null = await this.bridge.fetchQuote(desiredBridgeAmount);
-          if (quote) {
-            let gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
-            let requiredReserve = gasPrice * gasEstimate;
-            if (strategyAllocation <= requiredReserve) {
-              logger.warn(
-                {
-                  allocationEth: fromWei(strategyAllocation),
-                  requiredGasEth: fromWei(requiredReserve),
-                },
-                'Strategy allocation insufficient to cover bridge gas requirements',
-              );
-              quote = null;
-            } else {
-              const maxSendable = strategyAllocation - requiredReserve;
-              if (quote.amountWei > maxSendable) {
-                const adjustedAmount = maxSendable;
-                if (adjustedAmount <= 0n) {
-                  logger.warn(
+        let quote: BridgeQuote | null = null;
+        const quoteResult = await this.bridge.fetchQuote(desiredBridgeAmount);
+        if (!quoteResult.success || !quoteResult.data) {
+          logger.warn(
+            {
+              allocationEth: fromWei(strategyAllocation),
+              requestedBridgeEth: fromWei(desiredBridgeAmount),
+              error: quoteResult.error?.message ?? 'Bridge quote unavailable',
+            },
+            'Unable to obtain bridge quote; skipping bridge',
+          );
+        } else {
+          quote = quoteResult.data;
+          let gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
+          let requiredReserve = gasPrice * gasEstimate;
+          if (strategyAllocation <= requiredReserve) {
+            logger.warn(
+              {
+                allocationEth: fromWei(strategyAllocation),
+                requiredGasEth: fromWei(requiredReserve),
+              },
+              'Strategy allocation insufficient to cover bridge gas requirements',
+            );
+            quote = null;
+          } else {
+            const maxSendable = strategyAllocation - requiredReserve;
+            if (quote.amountWei > maxSendable) {
+              const adjustedAmount = maxSendable;
+              if (adjustedAmount <= 0n) {
+                logger.warn(
+                  {
+                    allocationEth: fromWei(strategyAllocation),
+                    requiredGasEth: fromWei(requiredReserve),
+                  },
+                  'Bridge amount after gas reserve is non-positive; skipping bridge',
+                );
+                quote = null;
+              } else if (adjustedAmount !== quote.amountWei) {
+                const adjustedResult = await this.bridge.fetchQuote(adjustedAmount);
+                if (!adjustedResult.success || !adjustedResult.data) {
+                  logger.error(
                     {
                       allocationEth: fromWei(strategyAllocation),
-                      requiredGasEth: fromWei(requiredReserve),
+                      requestedBridgeEth: fromWei(adjustedAmount),
+                      error: adjustedResult.error?.message ?? 'Bridge quote unavailable',
                     },
-                    'Bridge amount after gas reserve is non-positive; skipping bridge',
+                    'Failed to obtain adjusted bridge quote',
                   );
                   quote = null;
-                } else if (adjustedAmount !== quote.amountWei) {
-                  try {
-                    quote = await this.bridge.fetchQuote(adjustedAmount);
-                    gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
-                    requiredReserve = gasPrice * gasEstimate;
-                    if (
-                      strategyAllocation <= requiredReserve ||
-                      quote.amountWei > strategyAllocation - requiredReserve
-                    ) {
-                      logger.warn(
-                        {
-                          allocationEth: fromWei(strategyAllocation),
-                          requiredGasEth: fromWei(requiredReserve),
-                        },
-                        'Adjusted bridge quote still exceeds available balance after gas reserve',
-                      );
-                      quote = null;
-                    }
-                  } catch (error) {
-                    logger.error({ err: error }, 'Failed to obtain adjusted bridge quote');
+                } else {
+                  quote = adjustedResult.data;
+                  gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
+                  requiredReserve = gasPrice * gasEstimate;
+                  if (
+                    strategyAllocation <= requiredReserve ||
+                    quote.amountWei > strategyAllocation - requiredReserve
+                  ) {
+                    logger.warn(
+                      {
+                        allocationEth: fromWei(strategyAllocation),
+                        requiredGasEth: fromWei(requiredReserve),
+                      },
+                      'Adjusted bridge quote still exceeds available balance after gas reserve',
+                    );
                     quote = null;
                   }
                 }
               }
             }
           }
-          if (quote) {
-            const result = await this.bridge.executeBridge(quote);
-            bridgeExecuted = result.success;
-            if (result.success) {
-              bridgedAmountWei = quote.amountWei;
-            }
+        }
+        if (quote) {
+          const result = await this.bridge.executeBridge(quote);
+          bridgeExecuted = result.success;
+          if (result.success) {
+            bridgedAmountWei = quote.amountWei;
           }
-        } catch (error) {
-          logger.error({ err: error }, 'Failed to obtain bridge quote');
         }
       }
     } else if (strategyAllocation > 0n) {
@@ -208,12 +223,18 @@ export class StrategyRunner {
       const halfEth = balancesBeforeSwap.ethWei / 2n;
       if (halfEth > 0n) {
         await this.swap.ensureWethBalance(halfEth, balancesBeforeSwap.nativeEthWei);
-        try {
-          const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
-          const swapResult = await this.swap.executeSwap(quote);
+        const quoteResult = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
+        if (!quoteResult.success || !quoteResult.data) {
+          logger.warn(
+            {
+              swapEth: fromWei(halfEth),
+              error: quoteResult.error?.message ?? 'Swap quote unavailable',
+            },
+            'Unable to obtain swap quote; skipping swap',
+          );
+        } else {
+          const swapResult = await this.swap.executeSwap(quoteResult.data);
           swapExecuted = swapResult.success;
-        } catch (error) {
-          logger.error({ err: error }, 'Failed to obtain swap quote');
         }
       }
     }

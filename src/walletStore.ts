@@ -73,16 +73,26 @@ export const persistWalletRecords = (records: WalletRecord[]) => {
 
 export const ensureWalletState = (): HubWalletState => {
   const existing = loadWalletRecords();
-  if (existing && existing.length >= STRATEGY_CONSTANTS.walletCount) {
-    const hub = existing[STRATEGY_CONSTANTS.hubIndex];
-    const satellites = existing.filter((_, index) => index !== STRATEGY_CONSTANTS.hubIndex);
-    return { hub, satellites };
+  const expectedCount = STRATEGY_CONSTANTS.walletCount;
+  const hubIndex = STRATEGY_CONSTANTS.hubIndex;
+
+  if (existing) {
+    if (existing.length === expectedCount && hubIndex < existing.length) {
+      const hub = existing[hubIndex];
+      const satellites = existing.filter((_, index) => index !== hubIndex);
+      return { hub, satellites };
+    }
+
+    logger.warn(
+      { existingCount: existing.length, expectedCount, hubIndex },
+      'Wallet store does not match STRATEGY_WALLET_COUNT; regenerating deterministic set',
+    );
   }
 
-  logger.info('Generating new deterministic wallet set');
-  const generated = generateWalletRecords(STRATEGY_CONSTANTS.walletCount);
+  logger.info({ requestedCount: expectedCount, hubIndex }, 'Generating deterministic wallet set');
+  const generated = generateWalletRecords(expectedCount);
   persistWalletRecords(generated);
-  const hub = generated[STRATEGY_CONSTANTS.hubIndex];
-  const satellites = generated.filter((_, index) => index !== STRATEGY_CONSTANTS.hubIndex);
+  const hub = generated[hubIndex];
+  const satellites = generated.filter((_, index) => index !== hubIndex);
   return { hub, satellites };
 };

@@ -6,10 +6,11 @@ Bot TypeScript minimaliste pour exécuter le flow complet demandé :
 ## ✨ Points clés
 
 - 13 fichiers TypeScript pour couvrir toute la chaîne d'exécution.
-- Stockage chiffré et déterministe des 100 wallets (1 hub + 99 satellites) depuis votre **mnemonic**.
+- Stockage chiffré et déterministe d'un ensemble de wallets configurables (par défaut 100, dont 1 hub) depuis votre **mnemonic**.
 - Retrait Bybit via `ccxt` ou fallback depuis un wallet Base (clé privée dans `.env`).
 - Distribution hub → satellites avec montants aléatoires dans un intervalle configurable.
 - Bridge ETH Base → Abstract via l'API Jumper, puis swap 50/50 ETH/PENGU.
+- Gestion robuste des indisponibilités Jumper (bridge & swap) pour éviter les arrêts de cycle.
 - Fourniture de liquidité Uniswap **v2** (pool PENGU/WETH) en déployant ~80% de chaque jeton.
 - Collecte conditionnelle des fees (drift de prix, fees > 3× gas) puis recyclage partiel en ETH pour la sécurité.
 - Logs synthétiques (funding, bridge, swap, LP) pour vérifier un cycle en quelques lignes.
@@ -25,7 +26,7 @@ src/
 ├── types.ts           # Types partagés
 ├── walletStore.ts     # Génération + stockage chiffré des wallets
 ├── bybitClient.ts     # Intégration Bybit (retrait ETH)
-├── walletHub.ts       # Distribution depuis le hub vers 99 wallets
+├── walletHub.ts       # Distribution depuis le hub vers les wallets satellites configurables
 ├── bridgeService.ts   # Bridge Base → Abstract via Jumper
 ├── swapService.ts     # Swaps ETH↔PENGU + gestion du wrapping WETH
 ├── feeManager.ts      # Politique d'utilisation des fees
@@ -40,7 +41,7 @@ src/
 3. Les adresses des contrats (PENGU, WETH, router Uniswap v2, pool LP) doivent être vérifiées côté Abstract.
 
 Variables obligatoires :
-- `STRATEGY_MNEMONIC`, `HUB_WALLET_PASSWORD`, `HUB_WALLET_STORE`, `HUB_WALLET_INDEX`.
+- `STRATEGY_MNEMONIC`, `STRATEGY_WALLET_COUNT`, `HUB_WALLET_PASSWORD`, `HUB_WALLET_STORE`, `HUB_WALLET_INDEX`.
 - `BYBIT_API_KEY`, `BYBIT_API_SECRET` (facultatif si vous utilisez le mode wallet unique) et `HUB_WITHDRAW_AMOUNT`.
 - `BASE_FUNDING_PRIVATE_KEY` (optionnel) pour lancer le flow sans Bybit.
 - `RPC_BASE`, `RPC_ABSTRACT`, `CHAIN_ID_BASE`, `CHAIN_ID_ABSTRACT`.
@@ -55,7 +56,7 @@ cp env.example .env
 # puis éditez .env avec vos paramètres (voir ci-dessous)
 ```
 
-### Lancement standard (Bybit → Hub → 99 wallets)
+### Lancement standard (Bybit → Hub → satellites, 100 wallets par défaut)
 
 ```bash
 # 1. Construire le CLI
@@ -70,7 +71,7 @@ npm start -- balances
 
 Le cycle exécute automatiquement :
 1. Retrait Bybit (ou transfert depuis le wallet Base) vers le hub.
-2. Distribution aléatoire du hub vers les 99 satellites (dont le wallet stratégie).
+2. Distribution aléatoire du hub vers les satellites configurés (dont le wallet stratégie).
 3. Bridge du satellite stratégique → Abstract.
 4. Swap pour obtenir ~50% WETH / 50% PENGU.
 5. Dépôt d'~80% de chaque jeton dans le pool Uniswap v2 PENGU/WETH.
@@ -87,7 +88,7 @@ Pour un dry-run depuis un seul wallet Base :
 Le bot :
 
 - alimente le hub depuis ce wallet unique,
-- crée (ou recharge) les 99 wallets dérivés via la mnemonic,
+- crée (ou recharge) le nombre de wallets configuré dérivés via la mnemonic,
 - continue le flow complet (bridge, swap, LP) sans dépendance à Bybit.
 
 ### Logs & monitoring
@@ -112,7 +113,7 @@ Lorsque l'une de ces conditions est remplie :
 
 ## 🔒 Stockage des wallets
 
-- Les 100 wallets sont dérivés depuis `STRATEGY_MNEMONIC` (`m/44'/60'/0'/0/i`).
+- Le nombre de wallets (par défaut 100) est dérivé depuis `STRATEGY_MNEMONIC` (`m/44'/60'/0'/0/i`).
 - Chiffrement AES-256-GCM, clé dérivée via `scrypt` + salt unique.
 - Relancer le bot recharge automatiquement les wallets existants. Modifier `HUB_WALLET_INDEX` permet de choisir le hub à whitelister.
 - Les montants envoyés aux satellites sont randomisés dans l'intervalle `[SATELLITE_VARIANCE_MIN, SATELLITE_VARIANCE_MAX]` pour éviter des patterns fixes.
