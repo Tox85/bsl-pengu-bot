@@ -13,6 +13,32 @@ export interface PositionInfo {
   tokensOwed1: bigint;
 }
 
+export interface FeeSnapshot {
+  tokenId: bigint;
+  token0: string;
+  token1: string;
+  fee: number;
+  tokensOwed0: bigint;
+  tokensOwed1: bigint;
+}
+
+export interface FeeValueEstimation {
+  token0ValueWei: bigint;
+  token1ValueWei: bigint;
+  totalValueWei: bigint;
+}
+
+export interface HarvestBreakdown {
+  reinvest0: bigint;
+  reinvest1: bigint;
+  cashout0: bigint;
+  cashout1: bigint;
+  cashedOutEth: bigint;
+  reinvestTxHash?: string;
+  swapTxHash?: string;
+  unwrapTxHash?: string;
+}
+
 // Types pour les paramètres de création de position
 export interface CreatePositionParams {
   token0: string;

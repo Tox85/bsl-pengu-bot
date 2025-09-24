@@ -1168,21 +1168,9 @@ export class OrchestratorService {
       // Mettre à jour l'état
       state = this.stateManager.updateState(state, { currentStep: OrchestratorStep.COLLECT_PENDING });
 
-      // Attendre le délai spécifié
-      if (!context.dryRun) {
-        const waitTime = params.collectAfterMinutes * 60 * 1000; // Convertir en ms
-        logger.info({
-          wallet: state.wallet,
-          waitTime: params.collectAfterMinutes,
-          message: 'Attente avant collecte des frais'
-        });
-        
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-
       // Obtenir le tokenId de la position
       let tokenId = state.positionResult?.tokenId;
-      
+
       // Si pas dans positionResult, essayer de le lire depuis les données sauvegardées
       if (!tokenId) {
         const lpData = stateManager.getStepData('lp');
@@ -1190,7 +1178,7 @@ export class OrchestratorService {
           tokenId = BigInt(lpData.tokenId);
         }
       }
-      
+
       if (!context.dryRun && !tokenId) {
         throw new Error('TokenId de position non trouvé dans l\'état. Assurez-vous qu\'une position LP a été créée.');
       }
@@ -1198,6 +1186,31 @@ export class OrchestratorService {
       // Préparer les paramètres de collecte
       if (!tokenId && !context.dryRun) {
         throw new Error('TokenId de position LP manquant');
+      }
+
+      if (!context.dryRun && tokenId) {
+        const preview = await liquidityPositionService.getCollectableFees(tokenId);
+        logger.info({
+          wallet: state.wallet,
+          tokenId: tokenId.toString(),
+          owed0: preview.tokensOwed0.toString(),
+          owed1: preview.tokensOwed1.toString(),
+          message: 'Pré-visualisation des frais collectables'
+        });
+      }
+
+      // Attendre le délai spécifié
+      if (!context.dryRun) {
+        const waitTime = params.collectAfterMinutes * 60 * 1000; // Convertir en ms
+        if (waitTime > 0) {
+          logger.info({
+            wallet: state.wallet,
+            waitTime: params.collectAfterMinutes,
+            message: 'Attente avant collecte des frais'
+          });
+
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
       }
 
       const collectParams = {
@@ -1224,7 +1237,7 @@ export class OrchestratorService {
       }
 
       // Mettre à jour l'état avec le résultat
-      const finalStep = collectStatus === 'collect_skipped' ? OrchestratorStep.COLLECT_DONE : OrchestratorStep.COLLECT_DONE;
+      const finalStep = OrchestratorStep.COLLECT_DONE;
       state = this.stateManager.updateState(state, {
         currentStep: finalStep,
         collectResult: {
@@ -1237,8 +1250,14 @@ export class OrchestratorService {
           amount0: result.amount0,
           amount1: result.amount1,
           txHash: result.txHash || '',
-          success: true,
-          gasUsed: '0', // gasUsed sera calculé ailleurs
+          success: collectStatus === 'collect_executed',
+          gasUsed: result.gasUsed || '0',
+          reinvested0: result.reinvested0 ?? 0n,
+          reinvested1: result.reinvested1 ?? 0n,
+          cashedOutEth: result.cashedOutEth ?? 0n,
+          swapTxHash: result.swapTxHash || '',
+          unwrapTxHash: result.unwrapTxHash || '',
+          skippedReason: result.skippedReason,
         },
       });
 
@@ -1249,6 +1268,10 @@ export class OrchestratorService {
         amount1: result.amount1.toString(),
         txHash: result.txHash,
         status: collectStatus,
+        reinvested0: (result.reinvested0 ?? 0n).toString(),
+        reinvested1: (result.reinvested1 ?? 0n).toString(),
+        cashedOutEth: (result.cashedOutEth ?? 0n).toString(),
+        skippedReason: result.skippedReason,
         message: 'Frais collectés avec succès'
       });
 

@@ -1,8 +1,8 @@
-import { ethers, Interface, Log, ContractTransactionReceipt } from 'ethers';
-import { CONSTANTS } from '../config/env.js';
+import { ethers, Interface, Log, ContractTransactionReceipt, type Signer } from 'ethers';
+import { CONSTANTS, cfg } from '../config/env.js';
 import { logger, logError } from '../core/logger.js';
 import { withRetryRpc, withRetryTransaction } from '../core/retry.js';
-import { createSigner, getProvider, getGasPrice, estimateGasLimit } from '../core/rpc.js';
+import { createSigner, getProvider, getGasPrice } from '../core/rpc.js';
 import { 
   calculateTickRange, 
   calculateMinAmountOut, 
@@ -13,6 +13,8 @@ import {
 import { NONFUNGIBLE_POSITION_MANAGER_ABI, ERC20_MIN_ABI, UNIV3_FACTORY_ABI, UNIV3_POOL_ABI } from '../abis/index.js';
 import { MAX_UINT128 } from '../config/nums.js';
 import { CollectResult, CollectStatus } from '../core/collect-status.js';
+import { swapService } from '../dex/index.js';
+import { tokenService } from '../services/token.js';
 import type { 
   PositionInfo, 
   CreatePositionParams, 
@@ -22,7 +24,10 @@ import type {
   PositionResult,
   RangeParams,
   AmountParams,
-  CalculationResult
+  CalculationResult,
+  FeeSnapshot,
+  FeeValueEstimation,
+  HarvestBreakdown
 } from './types.js';
 
 // Helpers pour parsing des events
@@ -51,46 +56,20 @@ function parseCollectFromReceipt(
 
 // Service de gestion des positions LP Uniswap v3
 export class LiquidityPositionService {
-  private positionManager?: ethers.Contract;
+  private readonly provider: ethers.Provider;
+  private readonly positionManager: ethers.Contract;
 
   constructor() {
-    // L'initialisation sera faite via ensurePositionManager()
+    this.provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
+    this.positionManager = new ethers.Contract(
+      CONSTANTS.UNIV3.NF_POSITION_MANAGER,
+      NONFUNGIBLE_POSITION_MANAGER_ABI,
+      this.provider
+    );
   }
 
-  // IMPORTANT: synchrones, pas d'async, toujours return
-  private ensurePositionManager(): ethers.Contract {
-    if (this.positionManager) return this.positionManager;
-
-    const addr = process.env.NF_POSITION_MANAGER;
-    if (!addr) throw new Error('NF_POSITION_MANAGER manquant dans .env');
-
-    // Créer le signer pour le positionManager
-    const signer = new ethers.Wallet(process.env.PRIVATE_KEY!, getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT));
-    
-    // log utile
-    logger.info({ 
-      chainId: 2741, 
-      signer: signer.address, 
-      npmAddress: addr 
-    }, 'Initialisation du positionManager');
-
-    this.positionManager = new ethers.Contract(addr, NONFUNGIBLE_POSITION_MANAGER_ABI, signer);
-    
-    // Debug: vérifier que le contrat est bien créé
-    logger.info({
-      positionManagerExists: !!this.positionManager,
-      hasMint: !!this.positionManager?.mint,
-      message: 'Debug: positionManager créé'
-    });
-    
-    const result = this.positionManager;
-    logger.info({
-      resultExists: !!result,
-      resultHasMint: !!result?.mint,
-      message: 'Debug: avant return dans ensurePositionManager'
-    });
-    
-    return result;
+  private getPositionManager(signer?: Signer): ethers.Contract {
+    return signer ? this.positionManager.connect(signer) : this.positionManager;
   }
 
   // Créer une nouvelle position LP
@@ -128,7 +107,7 @@ export class LiquidityPositionService {
       const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
       const recipient = await signer.getAddress();
 
-      // Le positionManager sera initialisé via ensurePositionManager() quand nécessaire
+      // Le positionManager partagé est initialisé dans le constructeur
 
       // CORRECTION 1: Déterminer l'ordre correct des tokens depuis le pool
       const poolInfo = await this.getPoolInfo(params.token0, params.token1, params.fee);
@@ -226,56 +205,10 @@ export class LiquidityPositionService {
         deadline: params.deadline,
       };
 
-      // CORRECTION 5: Utiliser callStatic d'abord, puis estimateGas direct
-      logger.info({
-        thisExists: !!this,
-        ensurePositionManagerExists: !!this.ensurePositionManager,
-        message: 'Debug: avant ensurePositionManager()'
-      });
-      
-      const pm = this.ensurePositionManager();
-      
-      logger.info({
-        pmExists: !!pm,
-        pmHasMint: !!pm?.mint,
-        message: 'Debug: après ensurePositionManager()'
-      });
-      
-      // Debug: vérifier pm juste avant l'appel
-      logger.info({
-        pmBeforeCall: !!pm,
-        pmMintBeforeCall: !!pm?.mint,
-        message: 'Debug: juste avant pm.mint.staticCall'
-      });
-      
-      // Guard pour vérifier l'API ethers v6
-      if (!pm || !(pm as any).mint || !(pm as any).mint.staticCall) {
-        logger.error({
-          hasPm: !!pm,
-          hasMint: !!(pm as any)?.mint,
-          hasStaticCall: !!(pm as any)?.mint?.staticCall,
-          hasCallStatic: !!(pm as any)?.callStatic
-        }, "Ethers API mismatch: use pm.mint.staticCall with ethers v6");
-        throw new Error("Ethers v6 expected: pm.mint.staticCall is required");
-      }
-      
-      await pm.mint.staticCall(mintParams, { from: recipient, value: 0n });
-      logger.info({ message: 'staticCall mint réussi' });
-      
-      // Debug: vérifier pm juste après l'appel
-      logger.info({
-        pmAfterCall: !!pm,
-        pmMintAfterCall: !!pm?.mint,
-        message: 'Debug: juste après pm.mint.staticCall'
-      });
+      const pm = this.getPositionManager(signer);
 
-      // Debug: vérifier pm juste avant estimateGas
-      logger.info({
-        pmBeforeEstimateGas: !!pm,
-        pmMintBeforeEstimateGas: !!pm?.mint,
-        message: 'Debug: juste avant pm.mint.estimateGas'
-      });
-      
+      await pm.mint.staticCall(mintParams, { from: recipient, value: 0n });
+
       const gasLimit = await pm.mint.estimateGas(mintParams, { from: recipient, value: 0n });
       const gasPrice = await getGasPrice(signer.provider! as any);
 
@@ -388,7 +321,7 @@ export class LiquidityPositionService {
       };
 
       // Estimer le gas
-      const pm = this.ensurePositionManager();
+      const pm = this.getPositionManager(signer);
       const gasLimit = await pm.increaseLiquidity.estimateGas(increaseParams, { value: 0n });
 
       // Obtenir le gas price
@@ -485,7 +418,7 @@ export class LiquidityPositionService {
       };
 
       // Estimer le gas
-      const pm = this.ensurePositionManager();
+      const pm = this.getPositionManager(signer);
       const gasLimit = await pm.decreaseLiquidity.estimateGas(decreaseParams, { value: 0n });
 
       // Obtenir le gas price
@@ -540,6 +473,155 @@ export class LiquidityPositionService {
     }
   }
 
+  async getCollectableFees(tokenId: bigint): Promise<FeeSnapshot> {
+    const position = await this.getPosition(tokenId);
+
+    return {
+      tokenId,
+      token0: position.token0,
+      token1: position.token1,
+      fee: position.fee,
+      tokensOwed0: position.tokensOwed0,
+      tokensOwed1: position.tokensOwed1,
+    };
+  }
+
+  private async estimateTokenValueInWeth(
+    tokenAddress: string,
+    amount: bigint,
+    fee: number
+  ): Promise<{ valueWei: bigint }> {
+    if (amount === 0n) {
+      return { valueWei: 0n };
+    }
+
+    const lower = tokenAddress.toLowerCase();
+
+    if (lower === CONSTANTS.TOKENS.WETH.toLowerCase() || lower === CONSTANTS.NATIVE_ADDRESS) {
+      return { valueWei: amount };
+    }
+
+    try {
+      const quote = await swapService.getQuote({
+        tokenIn: tokenAddress,
+        tokenOut: CONSTANTS.TOKENS.WETH,
+        amountIn: amount,
+        fee,
+      });
+
+      return { valueWei: quote.amountOut };
+    } catch (error) {
+      logError(error, {
+        token: tokenAddress,
+        amount: amount.toString(),
+        context: 'estimateTokenValueInWeth'
+      });
+
+      return { valueWei: 0n };
+    }
+  }
+
+  private async estimateFeeValue(snapshot: FeeSnapshot): Promise<FeeValueEstimation> {
+    const token0Value = await this.estimateTokenValueInWeth(snapshot.token0, snapshot.tokensOwed0, snapshot.fee);
+    const token1Value = await this.estimateTokenValueInWeth(snapshot.token1, snapshot.tokensOwed1, snapshot.fee);
+
+    const totalValueWei = token0Value.valueWei + token1Value.valueWei;
+
+    return {
+      token0ValueWei: token0Value.valueWei,
+      token1ValueWei: token1Value.valueWei,
+      totalValueWei,
+    };
+  }
+
+  private computeHarvestBreakdown(
+    snapshot: FeeSnapshot,
+    values: FeeValueEstimation
+  ): HarvestBreakdown {
+    if (values.totalValueWei === 0n) {
+      return {
+        reinvest0: 0n,
+        reinvest1: 0n,
+        cashout0: 0n,
+        cashout1: 0n,
+        cashedOutEth: 0n,
+      };
+    }
+
+    const reinvestPercent = BigInt(cfg.FEE_REINVEST_PERCENT);
+    const reinvestValue = (values.totalValueWei * reinvestPercent) / 100n;
+
+    const reinvest0Value = values.token0ValueWei === 0n
+      ? 0n
+      : (reinvestValue * values.token0ValueWei) / values.totalValueWei;
+    const reinvest1Value = values.token1ValueWei === 0n
+      ? 0n
+      : (reinvestValue * values.token1ValueWei) / values.totalValueWei;
+
+    const reinvest0 = values.token0ValueWei === 0n
+      ? 0n
+      : snapshot.tokensOwed0 * reinvest0Value / values.token0ValueWei;
+    const reinvest1 = values.token1ValueWei === 0n
+      ? 0n
+      : snapshot.tokensOwed1 * reinvest1Value / values.token1ValueWei;
+
+    const cashout0 = snapshot.tokensOwed0 - reinvest0;
+    const cashout1 = snapshot.tokensOwed1 - reinvest1;
+
+    return {
+      reinvest0,
+      reinvest1,
+      cashout0,
+      cashout1,
+      cashedOutEth: 0n,
+    };
+  }
+
+  private async convertToWeth(
+    tokenAddress: string,
+    amount: bigint,
+    fee: number,
+    privateKey: string,
+    recipient: string
+  ): Promise<{ wethAmount: bigint; swapTxHash?: string }> {
+    if (amount === 0n) {
+      return { wethAmount: 0n };
+    }
+
+    const lower = tokenAddress.toLowerCase();
+
+    if (lower === CONSTANTS.TOKENS.WETH.toLowerCase()) {
+      return { wethAmount: amount };
+    }
+
+    if (lower === CONSTANTS.NATIVE_ADDRESS) {
+      return { wethAmount: amount };
+    }
+
+    const swapResult = await swapService.executeSwap({
+      tokenIn: tokenAddress,
+      tokenOut: CONSTANTS.TOKENS.WETH,
+      amountIn: amount,
+      slippageBps: cfg.SWAP_SLIPPAGE_BPS,
+      recipient,
+      fee,
+    }, privateKey, { dryRun: false });
+
+    if (!swapResult.success) {
+      logger.warn({
+        tokenIn: tokenAddress,
+        amount: amount.toString(),
+        message: 'Swap pour conversion WETH échoué'
+      });
+      return { wethAmount: 0n };
+    }
+
+    return {
+      wethAmount: swapResult.amountOut,
+      swapTxHash: swapResult.txHash,
+    };
+  }
+
   // Collecter les frais d'une position (version corrigée ethers v6)
   async collectFees(
     params: CollectFeesParams,
@@ -548,22 +630,37 @@ export class LiquidityPositionService {
   ): Promise<CollectResult> {
     const { dryRun = false } = options;
 
-    try {
+    if (dryRun) {
       logger.info({
         tokenId: params.tokenId.toString(),
-        recipient: params.recipient,
-        amount0Max: params.amount0Max.toString(),
-        amount1Max: params.amount1Max.toString(),
-        message: 'Collecte des frais'
+        message: 'Collecte ignorée (dry-run)'
       });
 
-      if (dryRun) {
+      return {
+        executed: false,
+        expected0: 0n,
+        expected1: 0n,
+        amount0: 0n,
+        amount1: 0n,
+        txHash: null,
+        gasUsed: undefined,
+        status: 'collect_skipped',
+        skippedReason: 'dry_run'
+      };
+    }
+
+    try {
+      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
+      const recipient = params.recipient || await signer.getAddress();
+      const pm = this.getPositionManager(signer);
+      const tokenId = params.tokenId;
+
+      const snapshot = await this.getCollectableFees(tokenId);
+
+      if (snapshot.tokensOwed0 === 0n && snapshot.tokensOwed1 === 0n) {
         logger.info({
-          tokenId: params.tokenId.toString(),
-          recipient: params.recipient,
-          amount0Max: params.amount0Max.toString(),
-          amount1Max: params.amount1Max.toString(),
-          message: 'DRY_RUN: Collecte des frais simulée'
+          tokenId: tokenId.toString(),
+          message: 'Aucun frais collectable, étape ignorée'
         });
 
         return {
@@ -574,107 +671,174 @@ export class LiquidityPositionService {
           amount1: 0n,
           txHash: null,
           gasUsed: undefined,
-          status: 'collect_skipped'
+          status: 'collect_skipped',
+          skippedReason: 'no_fees'
         };
       }
 
-      // Créer le signer
-      const signer = await createSigner(privateKey, CONSTANTS.CHAIN_IDS.ABSTRACT);
-      const pm = this.ensurePositionManager();
-      const to = params.recipient || await signer.getAddress();
-
       const collectParams = {
-        tokenId: params.tokenId,
-        recipient: to,
-        amount0Max: MAX_UINT128,
-        amount1Max: MAX_UINT128,
+        tokenId,
+        recipient,
+        amount0Max: params.amount0Max ?? MAX_UINT128,
+        amount1Max: params.amount1Max ?? MAX_UINT128,
       };
 
-      // 1) Simuler pour savoir s'il y a des frais à collecter
-      let expected0: bigint = 0n;
-      let expected1: bigint = 0n;
-      try {
-        // v6 simulation
-        const result = await pm.collect.staticCall(collectParams);
-        // Uniswap NPM retourne (uint256 amount0, uint256 amount1)
-        // ethers v6 retourne soit un tuple soit un objet nommé; normaliser vers BigInt
-        const a0 = (result?.[0] ?? (result?.amount0 as any) ?? 0n);
-        const a1 = (result?.[1] ?? (result?.amount1 as any) ?? 0n);
-        expected0 = BigInt(a0);
-        expected1 = BigInt(a1);
-      } catch (e) {
-        logger.warn({ 
-          tokenId: params.tokenId.toString(), 
-          err: String(e) 
-        }, "Collect.staticCall failed; will attempt tx anyway");
-      }
+      logger.info({
+        tokenId: tokenId.toString(),
+        recipient,
+        message: 'Collecte des frais démarrée'
+      });
 
-      // 2) Si rien à collecter, sortir proprement (évite .toString sur undefined)
-      if (expected0 === 0n && expected1 === 0n) {
+      const valueEstimate = await this.estimateFeeValue(snapshot);
+
+      const gasEstimate = await pm.collect.estimateGas(collectParams);
+      const gasPrice = await getGasPrice(signer.provider! as any);
+      const gasCostWei = gasEstimate * gasPrice;
+
+      const minMultiple = BigInt(cfg.FEE_GAS_MULTIPLE_TRIGGER);
+      if (valueEstimate.totalValueWei < gasCostWei * minMultiple) {
         logger.info({
-          tokenId: params.tokenId.toString(),
-          expected0: expected0.toString(),
-          expected1: expected1.toString(),
-        }, "No fees to collect yet; skipping collect tx");
-        
-        logger.info({
-          tokenId: params.tokenId.toString(),
-          status: 'collect_skipped'
-        }, "Collect status: collect_skipped");
-        
-        return { 
+          tokenId: tokenId.toString(),
+          estimatedFeesEth: ethers.formatEther(valueEstimate.totalValueWei),
+          gasCostEth: ethers.formatEther(gasCostWei),
+          minMultiple: cfg.FEE_GAS_MULTIPLE_TRIGGER,
+          message: 'Collecte ignorée car les frais ne couvrent pas le gas'
+        });
+
+        return {
           executed: false,
-          expected0: 0n,
-          expected1: 0n,
+          expected0: snapshot.tokensOwed0,
+          expected1: snapshot.tokensOwed1,
           amount0: 0n,
           amount1: 0n,
           txHash: null,
           gasUsed: undefined,
-          status: 'collect_skipped'
+          status: 'collect_skipped',
+          skippedReason: 'fees_below_threshold'
         };
       }
 
-      // 3) Estimer et envoyer la tx
-      const gas = await pm.collect.estimateGas(collectParams);
-      const tx = await pm.collect(collectParams, { 
-        gasLimit: gas + gas / 5n,
-        value: 0n
+      let expected0 = snapshot.tokensOwed0;
+      let expected1 = snapshot.tokensOwed1;
+
+      try {
+        const simulation = await pm.collect.staticCall(collectParams);
+        const a0 = (simulation?.[0] ?? (simulation as any)?.amount0 ?? 0n);
+        const a1 = (simulation?.[1] ?? (simulation as any)?.amount1 ?? 0n);
+        expected0 = BigInt(a0);
+        expected1 = BigInt(a1);
+      } catch (error) {
+        logger.debug({
+          tokenId: tokenId.toString(),
+          message: 'Static call collect indisponible, fallback sur balances locales'
+        });
+      }
+
+      const gasLimit = gasEstimate + gasEstimate / 5n;
+      const tx = await withRetryTransaction(async () => {
+        return await pm.collect(collectParams, {
+          gasLimit,
+          gasPrice,
+        });
       });
 
-      logger.info({
-        txHash: tx.hash,
-        message: 'Transaction de collecte de frais envoyée'
-      });
-
-      // Attendre la confirmation
       const receipt = await tx.wait();
-
       if (!receipt) {
-        throw new Error('Transaction de collecte de frais échouée');
+        throw new Error('Transaction de collecte non confirmée');
       }
 
-      // 4) Parser l'event Collect du receipt (robuste) et fallback vers les valeurs attendues
-      const parsed = parseCollectFromReceipt(receipt, pm.target as string);
-      const amount0 = parsed?.amount0 ?? expected0 ?? 0n;
-      const amount1 = parsed?.amount1 ?? expected1 ?? 0n;
+      const parsed = parseCollectFromReceipt(receipt as ContractTransactionReceipt, pm.target as string);
+      const amount0 = parsed?.amount0 ?? expected0;
+      const amount1 = parsed?.amount1 ?? expected1;
 
-      // Guard avant d'utiliser les montants décodés
-      if (parsed && (parsed.amount0 === undefined || parsed.amount1 === undefined)) {
-        logger.warn({ parsed }, "Parsed Collect missing amounts; falling back to staticCall values");
+      const harvestedSnapshot: FeeSnapshot = {
+        tokenId,
+        token0: snapshot.token0,
+        token1: snapshot.token1,
+        fee: snapshot.fee,
+        tokensOwed0: amount0,
+        tokensOwed1: amount1,
+      };
+
+      const harvestedValues = await this.estimateFeeValue(harvestedSnapshot);
+      const harvest = this.computeHarvestBreakdown(harvestedSnapshot, harvestedValues);
+
+      let reinvestTxHash: string | null = null;
+      if (harvest.reinvest0 > 0n || harvest.reinvest1 > 0n) {
+        const reinvestResult = await this.increaseLiquidity({
+          tokenId,
+          amount0Desired: harvest.reinvest0,
+          amount1Desired: harvest.reinvest1,
+          amount0Min: 0n,
+          amount1Min: 0n,
+          deadline: Math.floor(Date.now() / 1000) + 900,
+        }, privateKey, { dryRun: false });
+
+        if (reinvestResult.success) {
+          reinvestTxHash = reinvestResult.txHash ?? null;
+        } else if (reinvestResult.error) {
+          logger.warn({
+            tokenId: tokenId.toString(),
+            error: reinvestResult.error,
+            message: 'Augmentation de liquidité après collecte échouée'
+          });
+        }
+      }
+
+      let totalWethToUnwrap = 0n;
+      let swapTxHash: string | null = null;
+
+      const handleCashout = async (tokenAddress: string, amount: bigint) => {
+        if (amount === 0n) return;
+        const lower = tokenAddress.toLowerCase();
+
+        if (lower === CONSTANTS.NATIVE_ADDRESS) {
+          harvest.cashedOutEth += amount;
+          return;
+        }
+
+        const swapPortion = lower === CONSTANTS.TOKENS.PENGU.toLowerCase()
+          ? (amount * BigInt(cfg.PENGU_TO_ETH_FEE_SWAP_PERCENT)) / 100n
+          : amount;
+
+        if (swapPortion === 0n) return;
+
+        const conversion = await this.convertToWeth(tokenAddress, swapPortion, snapshot.fee, privateKey, recipient);
+        totalWethToUnwrap += conversion.wethAmount;
+        if (conversion.swapTxHash) {
+          swapTxHash = conversion.swapTxHash;
+        }
+      };
+
+      await handleCashout(snapshot.token0, harvest.cashout0);
+      await handleCashout(snapshot.token1, harvest.cashout1);
+
+      let unwrapTxHash: string | null = null;
+      if (totalWethToUnwrap > 0n) {
+        const humanAmount = ethers.formatUnits(totalWethToUnwrap, 18);
+        const unwrapResult = await tokenService.unwrapWETH(humanAmount, privateKey, { dryRun: false });
+        if (unwrapResult.success) {
+          unwrapTxHash = unwrapResult.txHash ?? null;
+          harvest.cashedOutEth += totalWethToUnwrap;
+        } else if (unwrapResult.error) {
+          logger.warn({
+            amount: humanAmount,
+            error: unwrapResult.error,
+            message: 'Unwrap WETH échoué lors de la collecte'
+          });
+        }
       }
 
       logger.info({
-        tokenId: params.tokenId.toString(),
+        tokenId: tokenId.toString(),
         amount0: amount0.toString(),
         amount1: amount1.toString(),
+        reinvest0: harvest.reinvest0.toString(),
+        reinvest1: harvest.reinvest1.toString(),
+        cashedOutEth: harvest.cashedOutEth.toString(),
         txHash: receipt.hash,
-        message: 'Frais collectés avec succès'
+        message: 'Collecte des frais exécutée'
       });
-
-      logger.info({
-        tokenId: params.tokenId.toString(),
-        status: 'collect_executed'
-      }, "Collect status: collect_executed");
 
       return {
         executed: true,
@@ -684,17 +848,18 @@ export class LiquidityPositionService {
         amount1,
         txHash: receipt.hash,
         gasUsed: receipt.gasUsed.toString(),
-        status: 'collect_executed'
+        status: 'collect_executed',
+        reinvested0: harvest.reinvest0,
+        reinvested1: harvest.reinvest1,
+        reinvestTxHash,
+        cashedOutEth: harvest.cashedOutEth,
+        swapTxHash,
+        unwrapTxHash,
       };
 
     } catch (error) {
       logError(error, { tokenId: params.tokenId.toString() });
-      
-      logger.info({
-        tokenId: params.tokenId.toString(),
-        status: 'collect_failed'
-      }, "Collect status: collect_failed");
-      
+
       return {
         executed: false,
         expected0: 0n,
@@ -711,7 +876,7 @@ export class LiquidityPositionService {
   // Obtenir les informations d'une position
   async getPosition(tokenId: bigint): Promise<PositionInfo> {
     const position = await withRetryRpc(async () => {
-      const pm = this.ensurePositionManager();
+      const pm = this.getPositionManager();
       return await pm.positions(tokenId);
     });
 
@@ -808,131 +973,49 @@ export class LiquidityPositionService {
 
   // Extraire le tokenId du receipt
   private extractTokenIdFromReceipt(receipt: ethers.TransactionReceipt): bigint {
-    const pm = this.ensurePositionManager();
-    
-    // Debug: lister tous les events du receipt
-    logger.info({
-      logsCount: receipt.logs.length,
-      message: 'Debug: nombre de logs dans le receipt'
-    });
-    
-    for (let i = 0; i < receipt.logs.length; i++) {
-      const log = receipt.logs[i];
-      logger.info({
-        logIndex: i,
-        address: log.address,
-        topics: log.topics,
-        data: log.data,
-        message: 'Debug: log du receipt'
-      });
-      
+    const pm = this.getPositionManager();
+    const npmAddress = (pm.target as string).toLowerCase();
+
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() !== npmAddress) continue;
+
       try {
-        const parsed = pm.interface.parseLog({
-          topics: log.topics,
-          data: log.data,
-        });
-        
-        if (parsed) {
-          logger.info({
-            logIndex: i,
-            eventName: parsed.name,
-            args: parsed.args,
-            message: 'Debug: event parsé'
-          });
-          
-          if (parsed.name === 'IncreaseLiquidity' || parsed.name === 'Mint') {
-            if (parsed.args.tokenId) {
-              logger.info({
-                tokenId: parsed.args.tokenId.toString(),
-                message: 'Debug: tokenId trouvé dans IncreaseLiquidity/Mint'
-              });
-              return BigInt(parsed.args.tokenId);
-            }
-          }
-          
-          if (parsed.name === 'Transfer') {
-            const { from, to, tokenId } = parsed.args;
-            logger.info({
-              from,
-              to,
-              tokenId: tokenId?.toString(),
-              message: 'Debug: event Transfer'
-            });
-            if (from === '0x0000000000000000000000000000000000000000') {
-              logger.info({
-                tokenId: tokenId.toString(),
-                message: 'Debug: tokenId trouvé dans Transfer mint'
-              });
-              return BigInt(tokenId);
-            }
-          }
-          
-          // Fallback: chercher le tokenId dans les topics si les args ne le contiennent pas
-          if (parsed.name === 'Transfer' && log.topics.length >= 4) {
-            const from = log.topics[1];
-            const to = log.topics[2];
-            const tokenId = log.topics[3];
-            
-            logger.info({
-              from,
-              to,
-              tokenId: tokenId,
-              message: 'Debug: event Transfer (topics)'
-            });
-            
-            if (from === '0x0000000000000000000000000000000000000000') {
-              const tokenIdBigInt = BigInt(tokenId);
-              logger.info({
-                tokenId: tokenIdBigInt.toString(),
-                message: 'Debug: tokenId trouvé dans Transfer mint (topics)'
-              });
-              return tokenIdBigInt;
-            }
+        const parsed = pm.interface.parseLog({ topics: log.topics, data: log.data });
+
+        if (!parsed) {
+          continue;
+        }
+
+        if (parsed.name === 'Mint' || parsed.name === 'IncreaseLiquidity') {
+          const tokenId = parsed.args?.tokenId;
+          if (tokenId) {
+            return BigInt(tokenId);
           }
         }
-      } catch (error) {
-        // Ignorer les logs qui ne correspondent pas à notre contrat
-        logger.info({
-          logIndex: i,
-          error: error.message,
-          message: 'Debug: erreur parsing log'
-        });
+
+        if (parsed.name === 'Transfer') {
+          const args = parsed.args as Record<string, unknown> | undefined;
+          const parsedFrom = typeof args?.from === 'string' ? (args.from as string).toLowerCase() : undefined;
+          const fromTopic = typeof log.topics?.[1] === 'string' ? log.topics[1].toLowerCase() : undefined;
+          const from = parsedFrom ?? fromTopic;
+
+          let tokenIdValue: bigint | null = null;
+          const argTokenId = args?.tokenId as string | bigint | number | undefined;
+          if (typeof argTokenId === 'string' || typeof argTokenId === 'number' || typeof argTokenId === 'bigint') {
+            tokenIdValue = BigInt(argTokenId);
+          } else if (log.topics?.[3]) {
+            tokenIdValue = BigInt(log.topics[3]);
+          }
+
+          if (from === CONSTANTS.NATIVE_ADDRESS && tokenIdValue !== null) {
+            return tokenIdValue;
+          }
+        }
+      } catch {
         continue;
       }
     }
-    
-    // Fallback final: chercher directement dans les topics sans parsing
-    for (let i = 0; i < receipt.logs.length; i++) {
-      const log = receipt.logs[i];
-      
-      // Vérifier si c'est un event Transfer du NonfungiblePositionManager
-      if (log.address.toLowerCase() === process.env.NF_POSITION_MANAGER?.toLowerCase() && 
-          log.topics.length >= 4 && 
-          log.topics[0] === '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef') {
-        
-        const from = log.topics[1];
-        const to = log.topics[2];
-        const tokenId = log.topics[3];
-        
-        logger.info({
-          logIndex: i,
-          from,
-          to,
-          tokenId: tokenId,
-          message: 'Debug: event Transfer direct (topics)'
-        });
-        
-        if (from === '0x0000000000000000000000000000000000000000' || from === '0x0000000000000000000000000000000000000000000000000000000000000000') {
-          const tokenIdBigInt = BigInt(tokenId);
-          logger.info({
-            tokenId: tokenIdBigInt.toString(),
-            message: 'Debug: tokenId trouvé dans Transfer mint (direct)'
-          });
-          return tokenIdBigInt;
-        }
-      }
-    }
-    
+
     throw new Error('TokenId non trouvé dans le receipt');
   }
 
@@ -941,7 +1024,7 @@ export class LiquidityPositionService {
     // Chercher l'event IncreaseLiquidity ou Mint
     for (const log of receipt.logs) {
       try {
-        const pm = this.ensurePositionManager();
+        const pm = this.getPositionManager();
         const parsed = pm.interface.parseLog({
           topics: log.topics,
           data: log.data,
@@ -967,18 +1050,10 @@ export class LiquidityPositionService {
 
   // Obtenir les informations d'un pool
   private async getPoolInfo(tokenA: string, tokenB: string, fee: number): Promise<{ token0: string; token1: string; fee: number }> {
-    const provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
-    
-    // Utiliser directement process.env au lieu des constantes
-    const factoryAddress = process.env.UNIV3_FACTORY;
-    if (!factoryAddress) {
-      throw new Error('UNIV3_FACTORY non défini dans .env');
-    }
-    
     const pool = new ethers.Contract(
-      factoryAddress,
+      CONSTANTS.UNIV3.FACTORY,
       UNIV3_FACTORY_ABI,
-      provider
+      this.provider
     );
 
     const poolAddress = await withRetryRpc(async () => {
@@ -989,7 +1064,7 @@ export class LiquidityPositionService {
       throw new Error(`Pool non trouvé pour ${tokenA}/${tokenB} avec fee ${fee}`);
     }
 
-    const poolContract = new ethers.Contract(poolAddress, UNIV3_POOL_ABI, provider);
+    const poolContract = new ethers.Contract(poolAddress, UNIV3_POOL_ABI, this.provider);
     const [token0, token1] = await withRetryRpc(async () => {
       return await Promise.all([
         poolContract.token0(),
@@ -1003,8 +1078,7 @@ export class LiquidityPositionService {
   // Obtenir les décimales d'un token
   private async getTokenDecimals(tokenAddress: string): Promise<number> {
     if (/^0x0{40}$/i.test(tokenAddress)) return 18; // ETH natif
-    const provider = getProvider(CONSTANTS.CHAIN_IDS.ABSTRACT);
-    const erc20 = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, provider);
+    const erc20 = new ethers.Contract(tokenAddress, ERC20_MIN_ABI, this.provider);
     return await erc20.decimals();
   }
 

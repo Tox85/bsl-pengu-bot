@@ -148,4 +148,10 @@ export interface PositionResult {
   success: boolean;
   gasUsed?: string;
   error?: string;
+  reinvested0?: bigint;
+  reinvested1?: bigint;
+  cashedOutEth?: bigint;
+  swapTxHash?: string;
+  unwrapTxHash?: string;
+  skippedReason?: string;
 }

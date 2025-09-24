@@ -14,4 +14,11 @@ export interface CollectResult {
   txHash?: string | null;
   gasUsed?: string;
   status: CollectStatus;
+  reinvested0?: bigint;
+  reinvested1?: bigint;
+  reinvestTxHash?: string | null;
+  cashedOutEth?: bigint;
+  swapTxHash?: string | null;
+  unwrapTxHash?: string | null;
+  skippedReason?: string;
 }
