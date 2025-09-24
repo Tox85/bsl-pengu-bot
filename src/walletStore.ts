@@ -40,16 +40,18 @@ const ensureDirectory = (filePath: string) => {
   mkdirSync(dirname(filePath), { recursive: true });
 };
 
+const deriveWalletRecord = (root: HDNodeWallet, index: number): WalletRecord => {
+  const derived = root.derivePath(`m/44'/60'/0'/0/${index}`);
+  return {
+    label: index === STRATEGY_CONSTANTS.hubIndex ? 'hub' : `satellite-${index}`,
+    address: derived.address,
+    privateKey: derived.privateKey,
+  } satisfies WalletRecord;
+};
+
 export const generateWalletRecords = (count: number): WalletRecord[] => {
   const root = HDNodeWallet.fromPhrase(env.STRATEGY_MNEMONIC.trim());
-  return Array.from({ length: count }).map((_, index) => {
-    const derived = root.derivePath(`m/44'/60'/0'/0/${index}`);
-    return {
-      label: index === STRATEGY_CONSTANTS.hubIndex ? 'hub' : `satellite-${index}`,
-      address: derived.address,
-      privateKey: derived.privateKey,
-    } satisfies WalletRecord;
-  });
+  return Array.from({ length: count }).map((_, index) => deriveWalletRecord(root, index));
 };
 
 export const loadWalletRecords = (): WalletRecord[] | null => {
@@ -71,18 +73,88 @@ export const persistWalletRecords = (records: WalletRecord[]) => {
   logger.info({ count: records.length, path: PATHS.walletStore }, 'Wallet store saved');
 };
 
-export const ensureWalletState = (): HubWalletState => {
-  const existing = loadWalletRecords();
-  if (existing && existing.length >= STRATEGY_CONSTANTS.walletCount) {
-    const hub = existing[STRATEGY_CONSTANTS.hubIndex];
-    const satellites = existing.filter((_, index) => index !== STRATEGY_CONSTANTS.hubIndex);
-    return { hub, satellites };
+const selectActiveWallets = (records: WalletRecord[]): HubWalletState => {
+  const { activeWalletCount, hubIndex } = STRATEGY_CONSTANTS;
+  if (records.length < activeWalletCount) {
+    throw new Error(
+      `Wallet store contains ${records.length} entries but STRATEGY_ACTIVE_WALLET_COUNT requires ${activeWalletCount}`,
+    );
   }
 
-  logger.info('Generating new deterministic wallet set');
-  const generated = generateWalletRecords(STRATEGY_CONSTANTS.walletCount);
-  persistWalletRecords(generated);
-  const hub = generated[STRATEGY_CONSTANTS.hubIndex];
-  const satellites = generated.filter((_, index) => index !== STRATEGY_CONSTANTS.hubIndex);
+  const activeRecords = records.slice(0, activeWalletCount);
+  const hub = activeRecords[hubIndex];
+  if (!hub) {
+    throw new Error('Hub wallet index falls outside of the active wallet range');
+  }
+
+  const satellites = activeRecords.filter((_, index) => index !== hubIndex);
+  if (satellites.length === 0) {
+    throw new Error('STRATEGY_ACTIVE_WALLET_COUNT must include at least one satellite wallet');
+  }
+
   return { hub, satellites };
+};
+
+const extendDeterministicSet = (existing: WalletRecord[], targetCount: number): WalletRecord[] => {
+  const root = HDNodeWallet.fromPhrase(env.STRATEGY_MNEMONIC.trim());
+  const regenerated = Array.from({ length: targetCount }).map((_, index) => deriveWalletRecord(root, index));
+
+  const mismatchIndex = existing.findIndex(
+    (record, index) =>
+      record.address.toLowerCase() !== regenerated[index].address.toLowerCase() ||
+      record.privateKey.toLowerCase() !== regenerated[index].privateKey.toLowerCase(),
+  );
+
+  if (mismatchIndex !== -1) {
+    throw new Error(
+      `Existing wallet store entry ${mismatchIndex} does not match the configured mnemonic; refusing to overwrite`,
+    );
+  }
+
+  const merged = regenerated.map((record, index) =>
+    index < existing.length ? { ...record, label: existing[index].label } : record,
+  );
+
+  persistWalletRecords(merged);
+  return merged;
+};
+
+export const ensureWalletState = (): HubWalletState => {
+  const existing = loadWalletRecords();
+  const expectedCount = Math.max(STRATEGY_CONSTANTS.walletCount, STRATEGY_CONSTANTS.activeWalletCount);
+
+  if (!existing) {
+    logger.info(
+      { requestedCount: expectedCount, activeCount: STRATEGY_CONSTANTS.activeWalletCount },
+      'Generating deterministic wallet set',
+    );
+    const generated = generateWalletRecords(expectedCount);
+    persistWalletRecords(generated);
+    return selectActiveWallets(generated);
+  }
+
+  if (existing.length < expectedCount) {
+    logger.warn(
+      {
+        existingCount: existing.length,
+        requiredCount: expectedCount,
+        activeCount: STRATEGY_CONSTANTS.activeWalletCount,
+      },
+      'Wallet store smaller than required; regenerating deterministic set to extend the registry',
+    );
+    const extended = extendDeterministicSet(existing, expectedCount);
+    return selectActiveWallets(extended);
+  }
+
+  if (STRATEGY_CONSTANTS.activeWalletCount < existing.length) {
+    logger.info(
+      {
+        activeCount: STRATEGY_CONSTANTS.activeWalletCount,
+        totalCount: existing.length,
+      },
+      'Limiting strategy operations to the configured subset of deterministic wallets',
+    );
+  }
+
+  return selectActiveWallets(existing);
 };

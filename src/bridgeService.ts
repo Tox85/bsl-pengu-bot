@@ -16,7 +16,7 @@ export class BridgeService {
     this.signer = new Wallet(privateKey, this.provider);
   }
 
-  async fetchQuote(amountWei: bigint): Promise<BridgeQuote> {
+  async fetchQuote(amountWei: bigint): Promise<ExecutionResult<BridgeQuote>> {
     const params = {
       fromChain: NETWORKS.base.chainId,
       toChain: NETWORKS.abstract.chainId,
@@ -27,14 +27,46 @@ export class BridgeService {
       integratorId: 'bsl-pengu-bot',
     } as const;
 
-    const { data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params });
-    const route = data?.routes?.[0];
+    let data: unknown;
+    try {
+      ({ data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params }));
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status;
+        const detail =
+          typeof error.response?.data === 'string'
+            ? error.response.data
+            : JSON.stringify(error.response?.data ?? {});
+        const message = `Unable to fetch bridge quote from Jumper (status: ${status ?? 'unknown'}): ${
+          detail || error.message
+        }`;
+        return { success: false, error: new Error(message) };
+      }
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+    const response = data as { routes?: Array<unknown> };
+    const route = (response?.routes?.[0] ?? null) as Record<string, unknown> | null;
     if (!route) {
-      throw new Error('No bridge route available from Jumper');
+      return { success: false, error: new Error('No bridge route available from Jumper') };
     }
 
-    const tx = route.transactionRequest;
-    const minAmountOut = applySlippageBps(BigInt(route.estimate.toAmountMin ?? route.estimate.toAmount), env.BRIDGE_SLIPPAGE_BPS);
+    const tx = route.transactionRequest as { data?: string; to?: string } | undefined;
+    const estimate = route.estimate as
+      | { toAmountMin?: string; toAmount?: string; gasCosts?: Array<{ estimate?: string }> }
+      | undefined;
+    if (!tx?.to || !tx.data) {
+      return { success: false, error: new Error('Bridge quote missing transaction request payload') };
+    }
+    if (!estimate?.toAmount) {
+      return { success: false, error: new Error('Bridge quote missing amount estimate') };
+    }
+    const minAmountOut = applySlippageBps(
+      BigInt((estimate.toAmountMin ?? estimate.toAmount) as string),
+      env.BRIDGE_SLIPPAGE_BPS,
+    );
 
     const quote: BridgeQuote = {
       fromChainId: NETWORKS.base.chainId,
@@ -46,10 +78,10 @@ export class BridgeService {
       routeId: route.routeId,
       txData: tx.data,
       txTarget: tx.to,
-      gasEstimate: BigInt(route.estimate.gasCosts?.[0]?.estimate ?? 0),
+      gasEstimate: BigInt(estimate.gasCosts?.[0]?.estimate ?? 0),
     };
     logger.info({ routeId: quote.routeId }, 'Bridge quote received');
-    return quote;
+    return { success: true, data: quote };
   }
 
   async executeBridge(quote: BridgeQuote): Promise<ExecutionResult<void>> {

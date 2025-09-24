@@ -16,12 +16,26 @@ export class FeeManager {
     const penguToSwap = scalePercent(fees.accruedPengu, STRATEGY_CONSTANTS.penguToEthSafetySwapPercent * 100);
     let swappedEth = 0n;
     if (penguToSwap > 0n) {
-      const quote = await this.swapService.fetchQuote(TOKENS.pengu.address, TOKENS.eth.address, penguToSwap);
-      const result = await this.swapService.executeSwap(quote);
-      if (!result.success) {
-        logger.warn({ error: result.error }, 'Failed to swap PENGU fees to ETH');
+      const quoteResult = await this.swapService.fetchQuote(
+        TOKENS.pengu.address,
+        TOKENS.eth.address,
+        penguToSwap,
+      );
+      if (!quoteResult.success || !quoteResult.data) {
+        logger.warn(
+          {
+            penguToSwap: fromWei(penguToSwap),
+            error: quoteResult.error?.message ?? 'Swap quote unavailable',
+          },
+          'Unable to obtain swap quote while recycling fees',
+        );
       } else {
-        swappedEth = quote.minAmountOutWei;
+        const result = await this.swapService.executeSwap(quoteResult.data);
+        if (!result.success) {
+          logger.warn({ error: result.error }, 'Failed to swap PENGU fees to ETH');
+        } else {
+          swappedEth = quoteResult.data.minAmountOutWei;
+        }
       }
     }
 

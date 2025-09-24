@@ -5,6 +5,25 @@ import type { DistributionPlan, ExecutionResult, HubWalletState } from './types.
 import { logger } from './logger.js';
 import { fromWei } from './utils.js';
 
+const MIN_SATELLITE_TRANSFER_WEI = parseUnits('0.0002', 18);
+const MAX_GAS_RETRY_ATTEMPTS = 3;
+const GAS_PRICE_BUMP_BPS = 1_500n;
+
+const bumpGasPrice = (gasPriceWei: bigint): bigint => {
+  const increment = (gasPriceWei * GAS_PRICE_BUMP_BPS) / 10_000n;
+  return gasPriceWei + (increment > 0n ? increment : 1n);
+};
+
+const isReplacementUnderpriced = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') return false;
+  const typed = error as { code?: string; message?: string; info?: { error?: { message?: string } } };
+  if (typed.code === 'REPLACEMENT_UNDERPRICED') return true;
+  const message = typed.message?.toLowerCase() ?? '';
+  if (message.includes('replacement') && message.includes('underpriced')) return true;
+  const nestedMessage = typed.info?.error?.message?.toLowerCase() ?? '';
+  return nestedMessage.includes('replacement') && nestedMessage.includes('underpriced');
+};
+
 export class WalletHub {
   private readonly provider: JsonRpcProvider;
   private readonly hub: Wallet;
@@ -14,6 +33,17 @@ export class WalletHub {
     this.provider = new JsonRpcProvider(NETWORKS.base.rpcUrl, NETWORKS.base.chainId);
     this.hub = new Wallet(state.hub.privateKey, this.provider);
     this.satellites = state.satellites.map((wallet) => new Wallet(wallet.privateKey, this.provider));
+  }
+
+  async getNetworkGasPrice(): Promise<bigint> {
+    const feeData = await this.provider.getFeeData();
+    if (feeData.maxFeePerGas) {
+      return feeData.maxFeePerGas;
+    }
+    if (feeData.gasPrice) {
+      return feeData.gasPrice;
+    }
+    return this.provider.getGasPrice();
   }
 
   async getHubBalance(): Promise<bigint> {
@@ -27,32 +57,77 @@ export class WalletHub {
     return DISTRIBUTION_VARIANCE.minFactor + rand * (DISTRIBUTION_VARIANCE.maxFactor - DISTRIBUTION_VARIANCE.minFactor);
   }
 
-  createDistributionPlan(totalWei: bigint): DistributionPlan[] {
+  createDistributionPlan(totalWei: bigint, gasPriceWei: bigint): DistributionPlan[] {
     if (totalWei === 0n) return [];
-    const scale = 1_000_000n;
-    const factors = this.satellites.map(() => BigInt(Math.floor(this.randomFactor() * Number(scale))));
-    const totalFactor = factors.reduce((sum, factor) => sum + factor, 0n) || BigInt(this.satellites.length);
 
-    const provisional = factors.map((factor) => (totalWei * factor) / totalFactor);
-    const allocated = provisional.reduce((sum, amount) => sum + amount, 0n);
-    let remainder = totalWei - allocated;
+    const gasCostPerTx = gasPriceWei * 21_000n;
+    if (totalWei <= gasCostPerTx) {
+      logger.warn('Hub balance insufficient to cover gas for any satellite funding');
+      return [];
+    }
 
-    const plan = provisional.map((amountWei) => {
-      if (remainder > 0n) {
-        remainder -= 1n;
-        return amountWei + 1n;
+    const minTransferWei =
+      MIN_SATELLITE_TRANSFER_WEI > gasCostPerTx * 2n ? MIN_SATELLITE_TRANSFER_WEI : gasCostPerTx * 2n;
+
+    let eligibleCount = Math.min(
+      this.satellites.length,
+      Number(totalWei / (gasCostPerTx + minTransferWei)) || 0,
+    );
+
+    while (eligibleCount > 0) {
+      const distributionPool = totalWei - gasCostPerTx * BigInt(eligibleCount);
+      if (distributionPool <= 0n) {
+        eligibleCount -= 1;
+        continue;
       }
-      return amountWei;
-    });
+      if (distributionPool / BigInt(eligibleCount) < minTransferWei) {
+        eligibleCount -= 1;
+        continue;
+      }
+      break;
+    }
 
-    return this.satellites.map((satellite, index) => ({
+    const plan = this.satellites.map((satellite, index) => ({
       recipient: {
         label: `satellite-${index + 1}`,
         address: satellite.address,
         privateKey: satellite.privateKey,
       },
-      amountWei: plan[index],
+      amountWei: 0n,
     }));
+
+    if (eligibleCount === 0) {
+      logger.warn('Unable to allocate funds to satellites after reserving gas and minimum transfers');
+      return plan;
+    }
+
+    const distributionPool = totalWei - gasCostPerTx * BigInt(eligibleCount);
+    const guaranteed = minTransferWei * BigInt(eligibleCount);
+    let remaining = distributionPool - guaranteed;
+    if (remaining < 0n) {
+      remaining = 0n;
+    }
+
+    const scale = 1_000_000n;
+    const factors = Array.from({ length: eligibleCount }).map(() =>
+      BigInt(Math.floor(this.randomFactor() * Number(scale))),
+    );
+    const totalFactor = factors.reduce((sum, factor) => sum + factor, 0n) || BigInt(eligibleCount);
+
+    const extras = factors.map((factor) => (remaining * factor) / totalFactor);
+    const allocatedExtras = extras.reduce((sum, amount) => sum + amount, 0n);
+    let remainder = remaining - allocatedExtras;
+
+    for (let index = 0; index < eligibleCount; index += 1) {
+      let amountWei = minTransferWei + extras[index];
+      if (remainder > 0n) {
+        amountWei += 1n;
+        remainder -= 1n;
+      }
+      plan[index].amountWei = amountWei;
+    }
+
+    return plan;
   }
 
   async executeDistribution(plan: DistributionPlan[], gasPriceWei: bigint): Promise<ExecutionResult<void>> {
@@ -63,18 +138,40 @@ export class WalletHub {
 
     let fundedCount = 0;
     let totalWei = 0n;
+    let effectiveGasPrice = gasPriceWei;
     try {
       for (const item of plan) {
         if (item.amountWei === 0n) continue;
-        const tx = await this.hub.sendTransaction({
-          to: item.recipient.address,
-          value: item.amountWei,
-          gasPrice: gasPriceWei,
-        });
-        await tx.wait();
-        fundedCount += 1;
-        totalWei += item.amountWei;
-        logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+        let attempt = 0;
+        for (;;) {
+          try {
+            const tx = await this.hub.sendTransaction({
+              to: item.recipient.address,
+              value: item.amountWei,
+              gasPrice: effectiveGasPrice,
+            });
+            await tx.wait();
+            fundedCount += 1;
+            totalWei += item.amountWei;
+            logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+            break;
+          } catch (error) {
+            if (isReplacementUnderpriced(error) && attempt < MAX_GAS_RETRY_ATTEMPTS) {
+              attempt += 1;
+              effectiveGasPrice = bumpGasPrice(effectiveGasPrice);
+              logger.warn(
+                {
+                  attempt,
+                  bumpedGasPriceWei: effectiveGasPrice.toString(),
+                  recipient: item.recipient.address,
+                },
+                'Satellite funding replacement detected; retrying with higher gas price',
+              );
+              continue;
+            }
+            throw error;
+          }
+        }
       }
       if (fundedCount > 0) {
         logger.info(

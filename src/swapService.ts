@@ -25,7 +25,11 @@ export class SwapService {
     this.pengu = new Contract(TOKENS.pengu.address, ERC20_ABI, this.provider);
   }
 
-  async fetchQuote(tokenIn: string, tokenOut: string, amountWei: bigint): Promise<SwapQuote> {
+  async fetchQuote(
+    tokenIn: string,
+    tokenOut: string,
+    amountWei: bigint,
+  ): Promise<ExecutionResult<SwapQuote>> {
     const params = {
       fromChain: NETWORKS.abstract.chainId,
       toChain: NETWORKS.abstract.chainId,
@@ -36,12 +40,50 @@ export class SwapService {
       integratorId: 'bsl-pengu-bot-swap',
     } as const;
 
-    const { data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params });
-    const route = data?.routes?.[0];
-    if (!route) throw new Error('Unable to fetch swap quote from Jumper');
+    let data: unknown;
+    try {
+      ({ data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params }));
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status;
+        const detail =
+          typeof error.response?.data === 'string'
+            ? error.response.data
+            : JSON.stringify(error.response?.data ?? {});
+        const message = `Unable to fetch swap quote from Jumper (status: ${status ?? 'unknown'}): ${
+          detail || error.message
+        }`;
+        return { success: false, error: new Error(message) };
+      }
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+
+    const route = (data as { routes?: Array<unknown> })?.routes?.[0] as
+      | (Record<string, unknown> & {
+          transactionRequest?: { data?: string; to?: string; value?: string };
+          estimate?: { toAmount?: string; toAmountMin?: string };
+        })
+      | undefined;
+    if (!route) {
+      return { success: false, error: new Error('No swap route available from Jumper') };
+    }
     const tx = route.transactionRequest;
-    const minAmount = applySlippageBps(BigInt(route.estimate.toAmountMin ?? route.estimate.toAmount), env.SWAP_SLIPPAGE_BPS);
-    return {
+    const estimate = route.estimate;
+    if (!tx?.to || !tx.data) {
+      return { success: false, error: new Error('Swap quote missing transaction request payload') };
+    }
+    if (!estimate?.toAmount) {
+      return { success: false, error: new Error('Swap quote missing amount estimate') };
+    }
+
+    const minAmount = applySlippageBps(
+      BigInt(estimate.toAmountMin ?? estimate.toAmount),
+      env.SWAP_SLIPPAGE_BPS,
+    );
+    const quote: SwapQuote = {
       tokenIn,
       tokenOut,
       amountInWei: amountWei,
@@ -49,7 +91,9 @@ export class SwapService {
       calldata: tx.data,
       target: tx.to,
       valueWei: BigInt(tx.value ?? 0),
-    } satisfies SwapQuote;
+    };
+    logger.info({ tokenIn, tokenOut, amountWei: amountWei.toString() }, 'Swap quote received');
+    return { success: true, data: quote };
   }
 
   async executeSwap(quote: SwapQuote): Promise<ExecutionResult<void>> {
