@@ -6,7 +6,7 @@ import { LPManager } from './lpManager.js';
 import { FeeManager } from './feeManager.js';
 import { ensureWalletState } from './walletStore.js';
 import { env, STRATEGY_CONSTANTS, TOKENS } from './config.js';
-import type { LiquidityPosition, StrategyReport, RebalanceReason } from './types.js';
+import type { LiquidityPosition, StrategyReport, RebalanceReason, BridgeQuote } from './types.js';
 import { toWei, weiFromGwei, scaleByPercent, now, fromWei } from './utils.js';
 import { logger } from './logger.js';
 
@@ -39,6 +39,8 @@ type CycleLogSummary = {
   };
 };
 
+const BRIDGE_GAS_LIMIT_FALLBACK = 250_000n;
+
 export class StrategyRunner {
   private readonly walletState = ensureWalletState();
   private readonly bybit = new BybitClient();
@@ -57,7 +59,16 @@ export class StrategyRunner {
 
   async executeCycle(): Promise<StrategyReport> {
     const withdrawAmountWei = toWei(env.HUB_WITHDRAW_AMOUNT);
-    const gasPrice = weiFromGwei(env.GAS_PRICE_GWEI);
+    const configuredGasPrice = weiFromGwei(env.GAS_PRICE_GWEI);
+    let gasPrice = configuredGasPrice;
+    try {
+      const networkGasPrice = await this.walletHub.getNetworkGasPrice();
+      if (networkGasPrice > gasPrice) {
+        gasPrice = networkGasPrice;
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Failed to fetch network gas price; falling back to configured value');
+    }
 
     logger.info('Starting strategy cycle');
 
@@ -80,28 +91,113 @@ export class StrategyRunner {
       await this.bybit.withdrawEthToHub(withdrawAmountWei, this.walletState.hub.address);
       summary.funding.source = 'BYBIT';
     } else if (env.BASE_FUNDING_PRIVATE_KEY) {
-      await this.walletHub.fundHubFromExternal(env.BASE_FUNDING_PRIVATE_KEY, withdrawAmountWei, gasPrice);
+      const result = await this.walletHub.fundHubFromExternal(
+        env.BASE_FUNDING_PRIVATE_KEY,
+        withdrawAmountWei,
+        gasPrice,
+      );
       summary.funding.source = 'BASE';
+      if (!result.success) {
+        logger.warn('Funding hub from base wallet failed; continuing with existing hub balance');
+      }
     } else {
       logger.warn('No Bybit credentials or base funding key provided; skipping external funding');
       summary.funding.source = 'NONE';
     }
     const hubBalance = await this.walletHub.getHubBalance();
-    const plan = this.walletHub.createDistributionPlan(hubBalance);
+    const plan = this.walletHub.createDistributionPlan(hubBalance, gasPrice);
     summary.distribution.fundedWallets = plan.filter((item) => item.amountWei > 0n).length;
     summary.distribution.totalWei = plan.reduce((total, item) => total + item.amountWei, 0n);
-    summary.funding.confirmedWei = summary.distribution.totalWei;
-    await this.walletHub.executeDistribution(plan, gasPrice);
+    const distributionResult = await this.walletHub.executeDistribution(plan, gasPrice);
+    summary.funding.confirmedWei = distributionResult.success ? summary.distribution.totalWei : 0n;
+    if (!distributionResult.success) {
+      summary.distribution.fundedWallets = 0;
+      summary.distribution.totalWei = 0n;
+    }
 
     let bridgeExecuted = false;
-    const strategyAllocation = plan[0]?.amountWei ?? 0n;
-    if (strategyAllocation > 0n) {
-      const quote = await this.bridge.fetchQuote(strategyAllocation);
-      const result = await this.bridge.executeBridge(quote);
-      bridgeExecuted = result.success;
+    let bridgedAmountWei = 0n;
+    const strategyEntry = plan.find((item) => item.recipient.address === this.strategyWallet.address);
+    const strategyAllocation = distributionResult.success ? strategyEntry?.amountWei ?? 0n : 0n;
+    const fallbackBridgeReserve = gasPrice * BRIDGE_GAS_LIMIT_FALLBACK;
+    if (strategyAllocation > fallbackBridgeReserve) {
+      const desiredBridgeAmount = strategyAllocation - fallbackBridgeReserve;
+      if (desiredBridgeAmount > 0n) {
+        try {
+          let quote: BridgeQuote | null = await this.bridge.fetchQuote(desiredBridgeAmount);
+          if (quote) {
+            let gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
+            let requiredReserve = gasPrice * gasEstimate;
+            if (strategyAllocation <= requiredReserve) {
+              logger.warn(
+                {
+                  allocationEth: fromWei(strategyAllocation),
+                  requiredGasEth: fromWei(requiredReserve),
+                },
+                'Strategy allocation insufficient to cover bridge gas requirements',
+              );
+              quote = null;
+            } else {
+              const maxSendable = strategyAllocation - requiredReserve;
+              if (quote.amountWei > maxSendable) {
+                const adjustedAmount = maxSendable;
+                if (adjustedAmount <= 0n) {
+                  logger.warn(
+                    {
+                      allocationEth: fromWei(strategyAllocation),
+                      requiredGasEth: fromWei(requiredReserve),
+                    },
+                    'Bridge amount after gas reserve is non-positive; skipping bridge',
+                  );
+                  quote = null;
+                } else if (adjustedAmount !== quote.amountWei) {
+                  try {
+                    quote = await this.bridge.fetchQuote(adjustedAmount);
+                    gasEstimate = quote.gasEstimate > 0n ? quote.gasEstimate : BRIDGE_GAS_LIMIT_FALLBACK;
+                    requiredReserve = gasPrice * gasEstimate;
+                    if (
+                      strategyAllocation <= requiredReserve ||
+                      quote.amountWei > strategyAllocation - requiredReserve
+                    ) {
+                      logger.warn(
+                        {
+                          allocationEth: fromWei(strategyAllocation),
+                          requiredGasEth: fromWei(requiredReserve),
+                        },
+                        'Adjusted bridge quote still exceeds available balance after gas reserve',
+                      );
+                      quote = null;
+                    }
+                  } catch (error) {
+                    logger.error({ err: error }, 'Failed to obtain adjusted bridge quote');
+                    quote = null;
+                  }
+                }
+              }
+            }
+          }
+          if (quote) {
+            const result = await this.bridge.executeBridge(quote);
+            bridgeExecuted = result.success;
+            if (result.success) {
+              bridgedAmountWei = quote.amountWei;
+            }
+          }
+        } catch (error) {
+          logger.error({ err: error }, 'Failed to obtain bridge quote');
+        }
+      }
+    } else if (strategyAllocation > 0n) {
+      logger.warn(
+        {
+          allocationEth: fromWei(strategyAllocation),
+          requiredGasEth: fromWei(fallbackBridgeReserve),
+        },
+        'Strategy allocation insufficient to cover bridge amount after reserving gas',
+      );
     }
     summary.bridge.executed = bridgeExecuted;
-    summary.bridge.amountWei = strategyAllocation;
+    summary.bridge.amountWei = bridgedAmountWei;
     if (!bridgeExecuted && strategyAllocation === 0n) {
       logger.warn('Strategy wallet received no new funds; proceeding with existing balances');
     }
@@ -112,9 +208,13 @@ export class StrategyRunner {
       const halfEth = balancesBeforeSwap.ethWei / 2n;
       if (halfEth > 0n) {
         await this.swap.ensureWethBalance(halfEth, balancesBeforeSwap.nativeEthWei);
-        const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
-        const swapResult = await this.swap.executeSwap(quote);
-        swapExecuted = swapResult.success;
+        try {
+          const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
+          const swapResult = await this.swap.executeSwap(quote);
+          swapExecuted = swapResult.success;
+        } catch (error) {
+          logger.error({ err: error }, 'Failed to obtain swap quote');
+        }
       }
     }
 

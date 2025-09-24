@@ -5,6 +5,8 @@ import type { DistributionPlan, ExecutionResult, HubWalletState } from './types.
 import { logger } from './logger.js';
 import { fromWei } from './utils.js';
 
+const MIN_SATELLITE_TRANSFER_WEI = parseUnits('0.0002', 18);
+
 export class WalletHub {
   private readonly provider: JsonRpcProvider;
   private readonly hub: Wallet;
@@ -14,6 +16,17 @@ export class WalletHub {
     this.provider = new JsonRpcProvider(NETWORKS.base.rpcUrl, NETWORKS.base.chainId);
     this.hub = new Wallet(state.hub.privateKey, this.provider);
     this.satellites = state.satellites.map((wallet) => new Wallet(wallet.privateKey, this.provider));
+  }
+
+  async getNetworkGasPrice(): Promise<bigint> {
+    const feeData = await this.provider.getFeeData();
+    if (feeData.maxFeePerGas) {
+      return feeData.maxFeePerGas;
+    }
+    if (feeData.gasPrice) {
+      return feeData.gasPrice;
+    }
+    return this.provider.getGasPrice();
   }
 
   async getHubBalance(): Promise<bigint> {
@@ -27,32 +40,77 @@ export class WalletHub {
     return DISTRIBUTION_VARIANCE.minFactor + rand * (DISTRIBUTION_VARIANCE.maxFactor - DISTRIBUTION_VARIANCE.minFactor);
   }
 
-  createDistributionPlan(totalWei: bigint): DistributionPlan[] {
+  createDistributionPlan(totalWei: bigint, gasPriceWei: bigint): DistributionPlan[] {
     if (totalWei === 0n) return [];
-    const scale = 1_000_000n;
-    const factors = this.satellites.map(() => BigInt(Math.floor(this.randomFactor() * Number(scale))));
-    const totalFactor = factors.reduce((sum, factor) => sum + factor, 0n) || BigInt(this.satellites.length);
 
-    const provisional = factors.map((factor) => (totalWei * factor) / totalFactor);
-    const allocated = provisional.reduce((sum, amount) => sum + amount, 0n);
-    let remainder = totalWei - allocated;
+    const gasCostPerTx = gasPriceWei * 21_000n;
+    if (totalWei <= gasCostPerTx) {
+      logger.warn('Hub balance insufficient to cover gas for any satellite funding');
+      return [];
+    }
 
-    const plan = provisional.map((amountWei) => {
-      if (remainder > 0n) {
-        remainder -= 1n;
-        return amountWei + 1n;
+    const minTransferWei =
+      MIN_SATELLITE_TRANSFER_WEI > gasCostPerTx * 2n ? MIN_SATELLITE_TRANSFER_WEI : gasCostPerTx * 2n;
+
+    let eligibleCount = Math.min(
+      this.satellites.length,
+      Number(totalWei / (gasCostPerTx + minTransferWei)) || 0,
+    );
+
+    while (eligibleCount > 0) {
+      const distributionPool = totalWei - gasCostPerTx * BigInt(eligibleCount);
+      if (distributionPool <= 0n) {
+        eligibleCount -= 1;
+        continue;
       }
-      return amountWei;
-    });
+      if (distributionPool / BigInt(eligibleCount) < minTransferWei) {
+        eligibleCount -= 1;
+        continue;
+      }
+      break;
+    }
 
-    return this.satellites.map((satellite, index) => ({
+    const plan = this.satellites.map((satellite, index) => ({
       recipient: {
         label: `satellite-${index + 1}`,
         address: satellite.address,
         privateKey: satellite.privateKey,
       },
-      amountWei: plan[index],
+      amountWei: 0n,
     }));
+
+    if (eligibleCount === 0) {
+      logger.warn('Unable to allocate funds to satellites after reserving gas and minimum transfers');
+      return plan;
+    }
+
+    const distributionPool = totalWei - gasCostPerTx * BigInt(eligibleCount);
+    const guaranteed = minTransferWei * BigInt(eligibleCount);
+    let remaining = distributionPool - guaranteed;
+    if (remaining < 0n) {
+      remaining = 0n;
+    }
+
+    const scale = 1_000_000n;
+    const factors = Array.from({ length: eligibleCount }).map(() =>
+      BigInt(Math.floor(this.randomFactor() * Number(scale))),
+    );
+    const totalFactor = factors.reduce((sum, factor) => sum + factor, 0n) || BigInt(eligibleCount);
+
+    const extras = factors.map((factor) => (remaining * factor) / totalFactor);
+    const allocatedExtras = extras.reduce((sum, amount) => sum + amount, 0n);
+    let remainder = remaining - allocatedExtras;
+
+    for (let index = 0; index < eligibleCount; index += 1) {
+      let amountWei = minTransferWei + extras[index];
+      if (remainder > 0n) {
+        amountWei += 1n;
+        remainder -= 1n;
+      }
+      plan[index].amountWei = amountWei;
+    }
+
+    return plan;
   }
 
   async executeDistribution(plan: DistributionPlan[], gasPriceWei: bigint): Promise<ExecutionResult<void>> {
