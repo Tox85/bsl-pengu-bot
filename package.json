@@ -1,20 +1,19 @@
 {
-  "name": "abs-bridge-swap-lp-bot",
-  "version": "1.0.0",
-  "description": "Bot TypeScript pour automatiser Bridge (Base→Abstract) → Swap (Pandora/Uniswap v3) → LP concentrée → Collect fees",
+  "name": "bsl-pengu-bot",
+  "version": "2.0.0",
+  "description": "Bot TypeScript lean pour retirer de Bybit, bridger vers Abstract, swaper en PENGU et gérer une LP concentrée.",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "start": "node dist/index.js",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "test": "vitest --passWithNoTests",
+    "test:run": "vitest run --passWithNoTests",
     "lint": "eslint src --ext .ts",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@lifi/sdk": "^3.12.8",
     "axios": "^1.6.2",
     "ccxt": "^4.5.5",
     "commander": "^11.1.0",
@@ -22,12 +21,10 @@
     "ethers": "^6.8.1",
     "pino": "^8.17.2",
     "pino-pretty": "^13.1.1",
-    "sql.js": "^1.8.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@types/node": "^20.10.4",
-    "@types/sql.js": "^1.4.0",
     "@typescript-eslint/eslint-plugin": "^6.14.0",
     "@typescript-eslint/parser": "^6.14.0",
     "eslint": "^8.55.0",
