@@ -13,6 +13,7 @@ const envSchema = z
   HUB_WALLET_INDEX: z.coerce.number().int().min(0).default(0),
   STRATEGY_MNEMONIC: z.string().min(12, 'Missing mnemonic for deterministic wallets'),
   STRATEGY_WALLET_COUNT: z.coerce.number().int().min(2).max(500).default(100),
+  STRATEGY_ACTIVE_WALLET_COUNT: z.coerce.number().int().min(2).max(500).optional(),
   BASE_FUNDING_PRIVATE_KEY: z.string().startsWith('0x').optional(),
   RPC_BASE: z.string().url(),
   RPC_ABSTRACT: z.string().url(),
@@ -34,11 +35,29 @@ const envSchema = z
   GAS_PRICE_GWEI: z.coerce.number().positive().default(0.1),
 })
   .superRefine((data, ctx) => {
+    const activeCount = data.STRATEGY_ACTIVE_WALLET_COUNT ?? data.STRATEGY_WALLET_COUNT;
+
     if (data.HUB_WALLET_INDEX >= data.STRATEGY_WALLET_COUNT) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['HUB_WALLET_INDEX'],
         message: 'HUB_WALLET_INDEX must be lower than STRATEGY_WALLET_COUNT',
+      });
+    }
+
+    if (activeCount > data.STRATEGY_WALLET_COUNT) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['STRATEGY_ACTIVE_WALLET_COUNT'],
+        message: 'STRATEGY_ACTIVE_WALLET_COUNT cannot exceed STRATEGY_WALLET_COUNT',
+      });
+    }
+
+    if (data.HUB_WALLET_INDEX >= activeCount) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['HUB_WALLET_INDEX'],
+        message: 'HUB_WALLET_INDEX must be within the active wallet range',
       });
     }
   });
@@ -47,6 +66,7 @@ export type Env = z.infer<typeof envSchema> & {
   BYBIT_API_KEY?: string;
   BYBIT_API_SECRET?: string;
   BASE_FUNDING_PRIVATE_KEY?: string;
+  STRATEGY_ACTIVE_WALLET_COUNT: number;
 };
 
 const parsedEnv = envSchema.parse(process.env);
@@ -58,6 +78,8 @@ export const env: Env = {
   BASE_FUNDING_PRIVATE_KEY: parsedEnv.BASE_FUNDING_PRIVATE_KEY?.trim()
     ? parsedEnv.BASE_FUNDING_PRIVATE_KEY.trim()
     : undefined,
+  STRATEGY_ACTIVE_WALLET_COUNT:
+    parsedEnv.STRATEGY_ACTIVE_WALLET_COUNT ?? parsedEnv.STRATEGY_WALLET_COUNT,
 };
 
 if (env.SATELLITE_VARIANCE_MIN >= env.SATELLITE_VARIANCE_MAX) {
@@ -66,6 +88,7 @@ if (env.SATELLITE_VARIANCE_MIN >= env.SATELLITE_VARIANCE_MAX) {
 
 export const STRATEGY_CONSTANTS = {
   walletCount: env.STRATEGY_WALLET_COUNT,
+  activeWalletCount: env.STRATEGY_ACTIVE_WALLET_COUNT,
   hubIndex: env.HUB_WALLET_INDEX,
   penguAllocation: 0.5,
   ethAllocation: 0.5,

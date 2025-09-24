@@ -7,6 +7,7 @@ Bot TypeScript minimaliste pour exécuter le flow complet demandé :
 
 - 13 fichiers TypeScript pour couvrir toute la chaîne d'exécution.
 - Stockage chiffré et déterministe d'un ensemble de wallets configurables (par défaut 100, dont 1 hub) depuis votre **mnemonic**.
+- Possibilité de limiter dynamiquement le nombre de wallets actifs via `STRATEGY_ACTIVE_WALLET_COUNT` sans régénérer le store existant.
 - Retrait Bybit via `ccxt` ou fallback depuis un wallet Base (clé privée dans `.env`).
 - Distribution hub → satellites avec montants aléatoires dans un intervalle configurable.
 - Bridge ETH Base → Abstract via l'API Jumper, puis swap 50/50 ETH/PENGU.
@@ -41,7 +42,7 @@ src/
 3. Les adresses des contrats (PENGU, WETH, router Uniswap v2, pool LP) doivent être vérifiées côté Abstract.
 
 Variables obligatoires :
-- `STRATEGY_MNEMONIC`, `STRATEGY_WALLET_COUNT`, `HUB_WALLET_PASSWORD`, `HUB_WALLET_STORE`, `HUB_WALLET_INDEX`.
+- `STRATEGY_MNEMONIC`, `STRATEGY_WALLET_COUNT`, `STRATEGY_ACTIVE_WALLET_COUNT`, `HUB_WALLET_PASSWORD`, `HUB_WALLET_STORE`, `HUB_WALLET_INDEX`.
 - `BYBIT_API_KEY`, `BYBIT_API_SECRET` (facultatif si vous utilisez le mode wallet unique) et `HUB_WITHDRAW_AMOUNT`.
 - `BASE_FUNDING_PRIVATE_KEY` (optionnel) pour lancer le flow sans Bybit.
 - `RPC_BASE`, `RPC_ABSTRACT`, `CHAIN_ID_BASE`, `CHAIN_ID_ABSTRACT`.
@@ -114,6 +115,7 @@ Lorsque l'une de ces conditions est remplie :
 ## 🔒 Stockage des wallets
 
 - Le nombre de wallets (par défaut 100) est dérivé depuis `STRATEGY_MNEMONIC` (`m/44'/60'/0'/0/i`).
+- `STRATEGY_ACTIVE_WALLET_COUNT` borne le nombre de wallets utilisés par le bot (ex. 2 pour n'activer que le hub + le premier satellite) tout en conservant les entrées excédentaires pour la production.
 - Chiffrement AES-256-GCM, clé dérivée via `scrypt` + salt unique.
 - Relancer le bot recharge automatiquement les wallets existants. Modifier `HUB_WALLET_INDEX` permet de choisir le hub à whitelister.
 - Les montants envoyés aux satellites sont randomisés dans l'intervalle `[SATELLITE_VARIANCE_MIN, SATELLITE_VARIANCE_MAX]` pour éviter des patterns fixes.
