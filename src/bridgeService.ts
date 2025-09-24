@@ -1,13 +1,14 @@
 import axios from 'axios';
 import { Contract, JsonRpcProvider, Wallet } from 'ethers';
 import type { TransactionRequest } from 'ethers';
-import { NETWORKS, env } from './config.js';
+import { NETWORKS, TOKENS, env } from './config.js';
 import type { BridgeQuote, ExecutionResult } from './types.js';
 import { applySlippageBps } from './utils.js';
 import { logger } from './logger.js';
 
 const LIFI_BASE_URL = 'https://li.quest/v1';
 const LIFI_NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const JUMPER_BASE_URL = 'https://api.jumper.exchange/v1';
 const ERC20_ABI = ['function balanceOf(address owner) view returns (uint256)'];
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -28,6 +29,17 @@ export class BridgeService {
   }
 
   async fetchQuote(amountWei: bigint): Promise<BridgeQuote> {
+    try {
+      return await this.fetchLifiQuote(amountWei);
+    } catch (error) {
+      logger.warn({ err: error }, 'LiFi quote failed, attempting Jumper fallback');
+    }
+    const fallback = await this.fetchJumperQuote(amountWei);
+    logger.info({ routeId: fallback.routeId }, 'Jumper bridge quote received');
+    return fallback;
+  }
+
+  private async fetchLifiQuote(amountWei: bigint): Promise<BridgeQuote> {
     const params = {
       fromChain: NETWORKS.base.chainId,
       toChain: NETWORKS.abstract.chainId,
@@ -83,6 +95,60 @@ export class BridgeService {
     };
     logger.info({ routeId: quote.routeId, tool: data?.tool }, 'LiFi bridge quote received');
     return quote;
+  }
+
+  private async fetchJumperQuote(amountWei: bigint): Promise<BridgeQuote> {
+    const params = {
+      fromChain: NETWORKS.base.chainId,
+      toChain: NETWORKS.abstract.chainId,
+      fromToken: TOKENS.eth.address,
+      toToken: TOKENS.eth.address,
+      amount: amountWei.toString(),
+      slippage: env.BRIDGE_SLIPPAGE_BPS / 100,
+      integratorId: 'bsl-pengu-bot',
+    } as const;
+
+    const { data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params });
+    const route = data?.routes?.[0];
+    if (!route?.transactionRequest) {
+      throw new Error('No bridge route available from Jumper');
+    }
+
+    const minAmountRaw = route.estimate?.toAmountMin ?? route.estimate?.toAmount;
+    if (!minAmountRaw) {
+      throw new Error('Jumper quote missing minimum amount estimate');
+    }
+
+    const minAmountOut = applySlippageBps(BigInt(minAmountRaw), env.BRIDGE_SLIPPAGE_BPS);
+    const gasEstimate = (route.estimate?.gasCosts ?? []).reduce<bigint>((total, cost) => {
+      try {
+        return total + BigInt(cost?.estimate ?? 0);
+      } catch (error) {
+        logger.warn({ err: error }, 'Failed to parse Jumper gas cost entry');
+        return total;
+      }
+    }, 0n);
+
+    const tx = route.transactionRequest;
+    const txValueWei = typeof tx.value === 'string' ? BigInt(tx.value) : undefined;
+    const gasLimit = typeof tx.gasLimit === 'string' ? BigInt(tx.gasLimit) : undefined;
+    const gasPriceWei = typeof tx.gasPrice === 'string' ? BigInt(tx.gasPrice) : undefined;
+
+    return {
+      fromChainId: NETWORKS.base.chainId,
+      toChainId: NETWORKS.abstract.chainId,
+      fromToken: TOKENS.eth.address,
+      toToken: TOKENS.eth.address,
+      amountWei,
+      minAmountOutWei: minAmountOut,
+      routeId: route.routeId ?? 'jumper-route',
+      txData: tx.data,
+      txTarget: tx.to,
+      gasEstimate,
+      txValueWei,
+      gasLimit,
+      gasPriceWei,
+    } satisfies BridgeQuote;
   }
 
   async executeBridge(quote: BridgeQuote): Promise<ExecutionResult<void>> {
@@ -142,5 +208,13 @@ export class BridgeService {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
     return false;
+  }
+
+  estimateTotalCost(quote: BridgeQuote, fallbackGasPrice: bigint): bigint {
+    const valueWei = quote.txValueWei ?? quote.amountWei;
+    const gasLimit = quote.gasLimit ?? quote.gasEstimate ?? 0n;
+    const gasPrice = quote.gasPriceWei ?? fallbackGasPrice;
+    const gasCost = gasLimit > 0n ? gasLimit * gasPrice : 0n;
+    return valueWei + gasCost;
   }
 }

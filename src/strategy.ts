@@ -6,7 +6,7 @@ import { LPManager } from './lpManager.js';
 import { FeeManager } from './feeManager.js';
 import { ensureWalletState } from './walletStore.js';
 import { env, STRATEGY_CONSTANTS, TOKENS } from './config.js';
-import type { LiquidityPosition, StrategyReport, RebalanceReason } from './types.js';
+import type { LiquidityPosition, StrategyReport, RebalanceReason, BridgeQuote } from './types.js';
 import { toWei, weiFromGwei, scaleByPercent, now, fromWei } from './utils.js';
 import { logger } from './logger.js';
 
@@ -101,34 +101,63 @@ export class StrategyRunner {
 
     let bridgeExecuted = false;
     const strategyAllocation = plan[0]?.amountWei ?? 0n;
-    const bridgeableAmount = strategyAllocation > bridgeGasBufferWei ? strategyAllocation - bridgeGasBufferWei : 0n;
-    if (bridgeableAmount > 0n) {
-      const quote = await this.bridge.fetchQuote(bridgeableAmount);
-      const destinationBalanceBefore = await this.bridge.getDestinationTokenBalance(quote.toToken);
-      const result = await this.bridge.executeBridge(quote);
-      if (result.success) {
-        const arrived = await this.bridge.waitForDestinationFunds(
-          quote.toToken,
-          destinationBalanceBefore,
-          quote.minAmountOutWei,
-        );
-        bridgeExecuted = arrived;
-        if (!arrived) {
+    const bridgeableBudget = strategyAllocation > bridgeGasBufferWei ? strategyAllocation - bridgeGasBufferWei : 0n;
+    let bridgeQuote: BridgeQuote | null = null;
+    if (bridgeableBudget > 0n) {
+      let attemptAmount = bridgeableBudget;
+      for (let attempt = 0; attempt < 3 && attemptAmount > 0n; attempt += 1) {
+        try {
+          const candidate = await this.bridge.fetchQuote(attemptAmount);
+          const required = this.bridge.estimateTotalCost(candidate, gasPrice);
+          if (required <= strategyAllocation) {
+            bridgeQuote = candidate;
+            break;
+          }
+          const deficit = required - strategyAllocation;
+          const reduced = attemptAmount > deficit ? attemptAmount - deficit : attemptAmount / 2n;
+          attemptAmount = reduced > 0n ? reduced : 0n;
           logger.warn(
             {
-              routeId: quote.routeId,
-              minAmountOut: fromWei(quote.minAmountOutWei),
+              routeId: candidate.routeId,
+              requiredTotalEth: fromWei(required),
+              availableEth: fromWei(strategyAllocation),
+              nextAttemptEth: fromWei(attemptAmount),
             },
-            'Bridge transaction confirmed but funds not detected within timeout',
+            'Bridge quote requires more balance than allocated; reducing amount and retrying',
           );
+        } catch (error) {
+          logger.error({ err: error, attemptAmount: fromWei(attemptAmount) }, 'Failed to obtain bridge quote');
+          attemptAmount = attemptAmount / 2n;
+        }
+      }
+
+      if (bridgeQuote) {
+        const destinationBalanceBefore = await this.bridge.getDestinationTokenBalance(bridgeQuote.toToken);
+        const result = await this.bridge.executeBridge(bridgeQuote);
+        if (result.success) {
+          const arrived = await this.bridge.waitForDestinationFunds(
+            bridgeQuote.toToken,
+            destinationBalanceBefore,
+            bridgeQuote.minAmountOutWei,
+          );
+          bridgeExecuted = arrived;
+          if (!arrived) {
+            logger.warn(
+              {
+                routeId: bridgeQuote.routeId,
+                minAmountOut: fromWei(bridgeQuote.minAmountOutWei),
+              },
+              'Bridge transaction confirmed but funds not detected within timeout',
+            );
+          }
         }
       }
     } else if (strategyAllocation > 0n) {
       logger.warn('Strategy allocation insufficient to cover bridge gas buffer; skipping bridge');
     }
     summary.bridge.executed = bridgeExecuted;
-    summary.bridge.amountWei = bridgeableAmount;
-    if (!bridgeExecuted && bridgeableAmount === 0n) {
+    summary.bridge.amountWei = bridgeQuote?.amountWei ?? bridgeableBudget;
+    if (!bridgeExecuted && (bridgeQuote?.amountWei ?? bridgeableBudget) === 0n) {
       logger.warn('Strategy wallet received no new funds; proceeding with existing balances');
     }
 
