@@ -67,3 +67,9 @@ export const differencePercent = (a: bigint, b: bigint): number => {
 export const weiFromGwei = (gwei: number): bigint => {
   return BigInt(Math.round(gwei * 1e9)) * 1_000_000_000n;
 };
+
+export const scaleByPercent = (value: bigint, fraction: number): bigint => {
+  if (fraction <= 0) return 0n;
+  const scaled = Math.round(fraction * 10000);
+  return (value * BigInt(scaled)) / 10000n;
+};

@@ -27,6 +27,11 @@ export class FeeManager {
     const reinvestEth = scalePercent(fees.accruedEth + swappedEth, STRATEGY_CONSTANTS.feeReinvestPercent * 100);
     const reinvestPengu = scalePercent(fees.accruedPengu - penguToSwap, STRATEGY_CONSTANTS.feeReinvestPercent * 100);
     logger.info({ reinvestEth, reinvestPengu }, 'Fees recycled for compounding');
-    return { ethWei: reinvestEth, penguWei: reinvestPengu };
+    return {
+      ethWei: reinvestEth,
+      penguWei: reinvestPengu,
+      nativeEthWei: 0n,
+      wethWei: reinvestEth,
+    };
   }
 }

@@ -1,5 +1,6 @@
+import { randomInt } from 'crypto';
 import { JsonRpcProvider, Wallet, parseUnits } from 'ethers';
-import { NETWORKS } from './config.js';
+import { DISTRIBUTION_VARIANCE, NETWORKS } from './config.js';
 import type { DistributionPlan, ExecutionResult, HubWalletState } from './types.js';
 import { logger } from './logger.js';
 
@@ -20,15 +21,36 @@ export class WalletHub {
     return balance;
   }
 
+  private randomFactor(): number {
+    const rand = randomInt(0, 1_000_000) / 1_000_000;
+    return DISTRIBUTION_VARIANCE.minFactor + rand * (DISTRIBUTION_VARIANCE.maxFactor - DISTRIBUTION_VARIANCE.minFactor);
+  }
+
   createDistributionPlan(totalWei: bigint): DistributionPlan[] {
-    const amountPerWallet = totalWei / BigInt(this.satellites.length);
+    if (totalWei === 0n) return [];
+    const scale = 1_000_000n;
+    const factors = this.satellites.map(() => BigInt(Math.floor(this.randomFactor() * Number(scale))));
+    const totalFactor = factors.reduce((sum, factor) => sum + factor, 0n) || BigInt(this.satellites.length);
+
+    const provisional = factors.map((factor) => (totalWei * factor) / totalFactor);
+    const allocated = provisional.reduce((sum, amount) => sum + amount, 0n);
+    let remainder = totalWei - allocated;
+
+    const plan = provisional.map((amountWei) => {
+      if (remainder > 0n) {
+        remainder -= 1n;
+        return amountWei + 1n;
+      }
+      return amountWei;
+    });
+
     return this.satellites.map((satellite, index) => ({
       recipient: {
         label: `satellite-${index + 1}`,
         address: satellite.address,
         privateKey: satellite.privateKey,
       },
-      amountWei: amountPerWallet,
+      amountWei: plan[index],
     }));
   }
 
@@ -62,6 +84,23 @@ export class WalletHub {
       });
       await tx.wait();
       logger.info({ from: satellite.address, txHash: tx.hash }, 'Returned residual funds to hub');
+    }
+  }
+
+  async fundHubFromExternal(privateKey: string, amountWei: bigint, gasPriceWei: bigint): Promise<ExecutionResult<void>> {
+    try {
+      const external = new Wallet(privateKey, this.provider);
+      const tx = await external.sendTransaction({
+        to: this.hub.address,
+        value: amountWei,
+        gasPrice: gasPriceWei,
+      });
+      await tx.wait();
+      logger.info({ txHash: tx.hash, from: external.address }, 'Funded hub directly from base wallet');
+      return { success: true, txHash: tx.hash };
+    } catch (error) {
+      logger.error({ err: error }, 'Failed to fund hub from external wallet');
+      return { success: false, error: error as Error };
     }
   }
 }

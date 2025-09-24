@@ -5,17 +5,29 @@ import type { ExecutionResult } from './types.js';
 import { logger } from './logger.js';
 
 export class BybitClient {
-  private readonly client: InstanceType<typeof ccxt.bybit>;
+  private readonly client: InstanceType<typeof ccxt.bybit> | null;
+  private readonly configured: boolean;
 
   constructor() {
-    this.client = new ccxt.bybit({
-      apiKey: env.BYBIT_API_KEY,
-      secret: env.BYBIT_API_SECRET,
-      enableRateLimit: true,
-    });
+    this.configured = Boolean(env.BYBIT_API_KEY && env.BYBIT_API_SECRET);
+    this.client = this.configured
+      ? new ccxt.bybit({
+          apiKey: env.BYBIT_API_KEY,
+          secret: env.BYBIT_API_SECRET,
+          enableRateLimit: true,
+        })
+      : null;
+  }
+
+  isConfigured() {
+    return this.configured;
   }
 
   async withdrawEthToHub(amountWei: bigint, address: string): Promise<ExecutionResult<void>> {
+    if (!this.client || !this.configured) {
+      logger.info('Bybit credentials missing, skipping exchange withdrawal');
+      return { success: false };
+    }
     try {
       const amount = formatUnits(amountWei, 18);
       const response = await this.client.withdraw('ETH', Number(amount), address, undefined, {
@@ -30,6 +42,7 @@ export class BybitClient {
   }
 
   async fetchAvailableEth(): Promise<bigint> {
+    if (!this.client || !this.configured) return 0n;
     const balances = await this.client.fetchBalance({ type: 'spot' });
     const freeBalances = balances.free ?? {};
     let amount = 0;

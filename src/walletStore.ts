@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname } from 'path';
 import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'crypto';
-import { Wallet } from 'ethers';
+import { HDNodeWallet } from 'ethers';
 import { PATHS, STRATEGY_CONSTANTS, env } from './config.js';
 import type { HubWalletState, WalletRecord } from './types.js';
 import { logger } from './logger.js';
@@ -41,12 +41,13 @@ const ensureDirectory = (filePath: string) => {
 };
 
 export const generateWalletRecords = (count: number): WalletRecord[] => {
+  const root = HDNodeWallet.fromPhrase(env.STRATEGY_MNEMONIC.trim());
   return Array.from({ length: count }).map((_, index) => {
-    const wallet = Wallet.createRandom();
+    const derived = root.derivePath(`m/44'/60'/0'/0/${index}`);
     return {
       label: index === STRATEGY_CONSTANTS.hubIndex ? 'hub' : `satellite-${index}`,
-      address: wallet.address,
-      privateKey: wallet.privateKey,
+      address: derived.address,
+      privateKey: derived.privateKey,
     } satisfies WalletRecord;
   });
 };

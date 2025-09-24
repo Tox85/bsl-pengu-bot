@@ -2,221 +2,271 @@ import {
   Contract,
   JsonRpcProvider,
   Wallet,
-  getAddress,
-  type ContractTransactionReceipt,
-  type Log,
-  type LogDescription,
 } from 'ethers';
-import { FEES, NETWORKS, TOKENS, env } from './config.js';
-import type { FeeSnapshot, LiquidityPosition, PositionInstruction, RebalanceReason } from './types.js';
-import { deriveRangeFromPrice, differencePercent, now } from './utils.js';
+import { DEX, FEES, NETWORKS, TOKENS } from './config.js';
+import type {
+  FeeSnapshot,
+  HarvestResult,
+  LiquidityPosition,
+  PositionInstruction,
+  RebalanceReason,
+} from './types.js';
+import { differencePercent, now } from './utils.js';
 import { logger } from './logger.js';
 
-const POSITION_MANAGER_ABI = [
-  'function positions(uint256 tokenId) view returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
-  'function mint((address token0,address token1,uint24 fee,int24 tickLower,int24 tickUpper,uint256 amount0Desired,uint256 amount1Desired,uint256 amount0Min,uint256 amount1Min,address recipient,uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
-  'function increaseLiquidity((uint256 tokenId,uint256 amount0Desired,uint256 amount1Desired,uint256 amount0Min,uint256 amount1Min,uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)',
-  'function decreaseLiquidity((uint256 tokenId,uint128 liquidity,uint256 amount0Min,uint256 amount1Min,uint256 deadline)) returns (uint256 amount0, uint256 amount1)',
-  'function collect((uint256 tokenId,address recipient,uint128 amount0Max,uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)',
-  'function burn(uint256 tokenId)'
+const ROUTER_ABI = [
+  'function addLiquidity(address tokenA,address tokenB,uint amountADesired,uint amountBDesired,uint amountAMin,uint amountBMin,address to,uint deadline) returns (uint amountA,uint amountB,uint liquidity)',
+  'function removeLiquidity(address tokenA,address tokenB,uint liquidity,uint amountAMin,uint amountBMin,address to,uint deadline) returns (uint amountA,uint amountB)',
 ];
 
-const POOL_ABI = [
-  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)',
-  'function liquidity() view returns (uint128)',
-  'function tickSpacing() view returns (int24)',
+const PAIR_ABI = [
+  'function getReserves() view returns (uint112 reserve0,uint112 reserve1,uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+  'function totalSupply() view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)',
 ];
 
 const ERC20_ABI = [
   'function approve(address spender, uint256 value) returns (bool)',
   'function allowance(address owner, address spender) view returns (uint256)',
   'function balanceOf(address owner) view returns (uint256)',
-  'function decimals() view returns (uint8)'
 ];
 
-const MAX_UINT128 = (1n << 128n) - 1n;
-const MAX_UINT256 = (1n << 256n) - 1n;
+const WETH_ABI = [
+  ...ERC20_ABI,
+  'function deposit() payable',
+  'function withdraw(uint256 amount)',
+];
+
+const MAX_ALLOWANCE = (1n << 256n) - 1n;
+
+type PositionSnapshot = {
+  currentEth: bigint;
+  currentPengu: bigint;
+  feesEth: bigint;
+  feesPengu: bigint;
+  priceScaled: bigint;
+};
+
+const scaleDown = (value: bigint, divisor: bigint) => (divisor === 0n ? 0n : value / divisor);
 
 export class LPManager {
   private readonly provider: JsonRpcProvider;
   private readonly signer: Wallet;
-  private readonly pool: Contract;
-  private readonly manager: Contract;
-  private currentPosition: LiquidityPosition | null = null;
-
-  private parseReceipt(receipt: ContractTransactionReceipt, eventNames: string[]): LogDescription | null {
-    for (const log of receipt.logs as Log[]) {
-      try {
-        const parsedLog = this.manager.interface.parseLog(log) as LogDescription;
-        if (eventNames.includes(parsedLog.name)) {
-          return parsedLog;
-        }
-      } catch {
-        continue;
-      }
-    }
-    return null;
-  }
-
-  private valueToBigInt(value: unknown): bigint {
-    if (typeof value === 'bigint') return value;
-    if (typeof value === 'number') return BigInt(Math.floor(value));
-    if (typeof value === 'string') return BigInt(value);
-    if (value && typeof value === 'object' && 'toString' in value) {
-      return BigInt((value as { toString(): string }).toString());
-    }
-    return 0n;
-  }
+  private readonly router: Contract;
+  private readonly pair: Contract;
+  private readonly weth: Contract;
+  private readonly pengu: Contract;
+  private tokenOrder: { token0: string; token1: string } | null = null;
 
   constructor(privateKey: string) {
     this.provider = new JsonRpcProvider(NETWORKS.abstract.rpcUrl, NETWORKS.abstract.chainId);
     this.signer = new Wallet(privateKey, this.provider);
-    this.pool = new Contract(env.TARGET_POOL_ADDRESS, POOL_ABI, this.signer);
-    this.manager = new Contract(env.POSITION_MANAGER_ADDRESS, POSITION_MANAGER_ABI, this.signer);
+    this.router = new Contract(DEX.router, ROUTER_ABI, this.signer);
+    this.pair = new Contract(DEX.pair, PAIR_ABI, this.signer);
+    this.weth = new Contract(TOKENS.eth.address, WETH_ABI, this.signer);
+    this.pengu = new Contract(TOKENS.pengu.address, ERC20_ABI, this.signer);
   }
 
-  async syncPosition(tokenId?: bigint): Promise<LiquidityPosition | null> {
-    const activeTokenId = tokenId ?? this.currentPosition?.tokenId;
-    if (!activeTokenId) return null;
-    const position = await this.manager.positions(activeTokenId);
-    const state: LiquidityPosition = {
-      tokenId: BigInt(activeTokenId),
-      lowerTick: Number(position.tickLower),
-      upperTick: Number(position.tickUpper),
-      liquidity: BigInt(position.liquidity),
-      depositedEth: BigInt(position.tokensOwed0 ?? 0),
-      depositedPengu: BigInt(position.tokensOwed1 ?? 0),
-      lastRebalancePrice: 0n,
-      lastCollectedFeesEth: 0n,
-      lastCollectedFeesPengu: 0n,
-    };
-    this.currentPosition = state;
-    return state;
+  private async ensureTokenOrder() {
+    if (!this.tokenOrder) {
+      const [token0, token1] = await Promise.all([this.pair.token0(), this.pair.token1()]);
+      this.tokenOrder = { token0: token0.toLowerCase(), token1: token1.toLowerCase() };
+    }
+    return this.tokenOrder;
   }
 
-  async ensureApprovals() {
-    const tokens = [TOKENS.eth.address, TOKENS.pengu.address];
-    for (const token of tokens) {
-      const contract = new Contract(token, ERC20_ABI, this.signer);
-      const allowance: bigint = (await contract.allowance(this.signer.address, env.POSITION_MANAGER_ADDRESS)).toBigInt();
-      if (allowance < MAX_UINT128) {
-        const tx = await contract.approve(env.POSITION_MANAGER_ADDRESS, MAX_UINT256);
+  private async getReserves() {
+    const reserves = await this.pair.getReserves();
+    const { token0 } = await this.ensureTokenOrder();
+    const reserve0 = BigInt(reserves[0]);
+    const reserve1 = BigInt(reserves[1]);
+    const reserveEth = token0 === TOKENS.eth.address.toLowerCase() ? reserve0 : reserve1;
+    const reservePengu = token0 === TOKENS.eth.address.toLowerCase() ? reserve1 : reserve0;
+    const price = reserveEth === 0n ? 0 : Number(reservePengu) / Number(reserveEth);
+    const priceScaled = BigInt(Math.round(price * 1e6));
+    return { reserveEth, reservePengu, priceScaled };
+  }
+
+  private async getTotalSupply(): Promise<bigint> {
+    return (await this.pair.totalSupply()).toBigInt();
+  }
+
+  private async ensureApprovals() {
+    const approvals: Array<{ token: Contract; name: string }> = [
+      { token: this.weth, name: 'WETH' },
+      { token: this.pengu, name: 'PENGU' },
+    ];
+    for (const { token, name } of approvals) {
+      const allowance = (await token.allowance(this.signer.address, DEX.router)).toBigInt();
+      if (allowance < MAX_ALLOWANCE / 2n) {
+        const tx = await token.approve(DEX.router, MAX_ALLOWANCE);
         await tx.wait();
-        logger.info({ token, txHash: tx.hash }, 'Approved position manager');
+        logger.info({ token: name, txHash: tx.hash }, 'Approved router for LP operations');
       }
     }
   }
 
-  async getCurrentPrice(): Promise<{ price: number; tickSpacing: number; tick: number }> {
-    const slot0 = await this.pool.slot0();
-    const sqrtPriceX96 = Number(slot0[0]);
-    const tick: number = Number(slot0[1]);
-    const tickSpacing: number = Number(await this.pool.tickSpacing());
-    const price = (sqrtPriceX96 / 2 ** 96) ** 2;
-    return { price, tickSpacing, tick };
+  private async ensureWrappedEth(targetWei: bigint) {
+    const current = (await this.weth.balanceOf(this.signer.address)).toBigInt();
+    if (current >= targetWei) return;
+    const shortfall = targetWei - current;
+    if (shortfall === 0n) return;
+    const tx = await this.weth.deposit({ value: shortfall });
+    await tx.wait();
+    logger.info({ amountWei: shortfall.toString() }, 'Wrapped native ETH into WETH');
+  }
+
+  private async shareForLpTokens(lpTokens: bigint) {
+    if (lpTokens === 0n) {
+      return { ethShare: 0n, penguShare: 0n, priceScaled: 0n };
+    }
+    const { reserveEth, reservePengu, priceScaled } = await this.getReserves();
+    const totalSupply = await this.getTotalSupply();
+    if (totalSupply === 0n) {
+      return { ethShare: 0n, penguShare: 0n, priceScaled };
+    }
+    const ethShare = (reserveEth * lpTokens) / totalSupply;
+    const penguShare = (reservePengu * lpTokens) / totalSupply;
+    return { ethShare, penguShare, priceScaled };
+  }
+
+  async getCurrentPrice(): Promise<{ price: number; priceScaled: bigint }> {
+    const { reserveEth, reservePengu, priceScaled } = await this.getReserves();
+    const price = reserveEth === 0n ? 0 : Number(reservePengu) / Number(reserveEth);
+    return { price, priceScaled };
   }
 
   async createPosition(instruction: PositionInstruction, gasPriceWei: bigint): Promise<LiquidityPosition> {
+    if (instruction.targetEthWei === 0n || instruction.targetPenguWei === 0n) {
+      throw new Error('Cannot create LP position with zero amounts');
+    }
+
     await this.ensureApprovals();
-    const { price, tickSpacing } = await this.getCurrentPrice();
-    const { lowerTick, upperTick } = deriveRangeFromPrice(price, instruction.rangePercent, tickSpacing);
+    await this.ensureWrappedEth(instruction.targetEthWei);
 
-    const deadline = now() + 600;
-    const [token0, token1] = [TOKENS.eth.address, TOKENS.pengu.address].sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
-    const amount0Desired = token0 === TOKENS.eth.address ? instruction.targetEthWei : instruction.targetPenguWei;
-    const amount1Desired = token0 === TOKENS.eth.address ? instruction.targetPenguWei : instruction.targetEthWei;
+    const { token0 } = await this.ensureTokenOrder();
+    const ethIsToken0 = token0 === TOKENS.eth.address.toLowerCase();
+    const amount0 = ethIsToken0 ? instruction.targetEthWei : instruction.targetPenguWei;
+    const amount1 = ethIsToken0 ? instruction.targetPenguWei : instruction.targetEthWei;
 
-    const tx = await this.manager.mint({
-      token0: getAddress(token0),
-      token1: getAddress(token1),
-      fee: env.FEE_TIER_BPS,
-      tickLower: lowerTick,
-      tickUpper: upperTick,
-      amount0Desired,
-      amount1Desired,
-      amount0Min: instruction.targetEthWei - instruction.targetEthWei / 10n,
-      amount1Min: instruction.targetPenguWei - instruction.targetPenguWei / 10n,
-      recipient: this.signer.address,
-      deadline,
-    }, { gasPrice: gasPriceWei });
+    const balanceBefore: bigint = (await this.pair.balanceOf(this.signer.address)).toBigInt();
+    const min0 = amount0 - scaleDown(amount0, 20n);
+    const min1 = amount1 - scaleDown(amount1, 20n);
 
-    const receipt = await tx.wait();
-    const event = this.parseReceipt(receipt, ['IncreaseLiquidity', 'Mint']);
+    const tx = await this.router.addLiquidity(
+      TOKENS.eth.address,
+      TOKENS.pengu.address,
+      amount0,
+      amount1,
+      min0 < 0n ? 0n : min0,
+      min1 < 0n ? 0n : min1,
+      this.signer.address,
+      BigInt(now() + 600),
+      { gasPrice: gasPriceWei },
+    );
+    await tx.wait();
 
-    const tokenId: bigint = this.valueToBigInt(event?.args?.tokenId ?? 0n);
+    const balanceAfter: bigint = (await this.pair.balanceOf(this.signer.address)).toBigInt();
+    const minted: bigint = balanceAfter - balanceBefore;
+
+    const { ethShare, penguShare, priceScaled } = await this.shareForLpTokens(minted);
 
     const position: LiquidityPosition = {
-      tokenId,
-      lowerTick,
-      upperTick,
-      liquidity: this.valueToBigInt(event?.args?.liquidity ?? 0n),
-      depositedEth: instruction.targetEthWei,
-      depositedPengu: instruction.targetPenguWei,
-      lastRebalancePrice: BigInt(Math.round(price * 1e6)),
+      lpTokenAmount: minted,
+      depositedEth: ethShare,
+      depositedPengu: penguShare,
+      lastPriceScaled: priceScaled,
+      lastHarvestTimestamp: now(),
       lastCollectedFeesEth: 0n,
       lastCollectedFeesPengu: 0n,
     };
 
-    this.currentPosition = position;
-    logger.info({ tokenId: position.tokenId?.toString() }, 'LP position created');
+    logger.info({ minted: minted.toString() }, 'LP position created on Uniswap v2 pair');
     return position;
   }
 
-  async collectFees(position: LiquidityPosition, gasPriceWei: bigint): Promise<FeeSnapshot> {
-    if (!position.tokenId) throw new Error('Position has no tokenId');
-    const tx = await this.manager.collect({
-      tokenId: position.tokenId,
-      recipient: this.signer.address,
-      amount0Max: MAX_UINT128,
-      amount1Max: MAX_UINT128,
-    }, { gasPrice: gasPriceWei });
-    const receipt = await tx.wait();
-    const event = this.parseReceipt(receipt, ['Collect']);
-
-    const amount0 = this.valueToBigInt(event?.args?.amount0 ?? 0n);
-    const amount1 = this.valueToBigInt(event?.args?.amount1 ?? 0n);
-    const fees: FeeSnapshot = {
-      accruedEth: amount0,
-      accruedPengu: amount1,
-      estimatedGasCostWei: gasPriceWei * 400000n,
-    };
-    if (this.currentPosition) {
-      this.currentPosition.lastCollectedFeesEth += amount0;
-      this.currentPosition.lastCollectedFeesPengu += amount1;
+  async estimatePosition(position: LiquidityPosition): Promise<PositionSnapshot> {
+    if (position.lpTokenAmount === 0n) {
+      return {
+        currentEth: 0n,
+        currentPengu: 0n,
+        feesEth: 0n,
+        feesPengu: 0n,
+        priceScaled: position.lastPriceScaled,
+      };
     }
-    logger.info({ fees }, 'Fees collected');
-    return fees;
-  }
-
-  async closePosition(position: LiquidityPosition, gasPriceWei: bigint): Promise<void> {
-    if (!position.tokenId) return;
-    await this.manager.decreaseLiquidity({
-      tokenId: position.tokenId,
-      liquidity: position.liquidity,
-      amount0Min: 0,
-      amount1Min: 0,
-      deadline: now() + 600,
-    }, { gasPrice: gasPriceWei });
-    await this.collectFees(position, gasPriceWei);
-    await this.manager.burn(position.tokenId, { gasPrice: gasPriceWei });
-    logger.info({ tokenId: position.tokenId.toString() }, 'Position closed');
-    this.currentPosition = null;
+    const { ethShare, penguShare, priceScaled } = await this.shareForLpTokens(position.lpTokenAmount);
+    const feesEth = ethShare > position.depositedEth ? ethShare - position.depositedEth : 0n;
+    const feesPengu = penguShare > position.depositedPengu ? penguShare - position.depositedPengu : 0n;
+    return { currentEth: ethShare, currentPengu: penguShare, feesEth, feesPengu, priceScaled };
   }
 
   evaluateRebalance(
     position: LiquidityPosition,
-    currentTick: number,
-    currentPriceScaled: bigint,
-    fees: FeeSnapshot,
+    snapshot: PositionSnapshot,
     gasCostWei: bigint,
   ): { shouldRebalance: boolean; reason: RebalanceReason | null } {
-    const priceChange = differencePercent(currentPriceScaled, position.lastRebalancePrice);
-    const priceOutOfRange = currentTick <= position.lowerTick || currentTick >= position.upperTick;
-    const feesWorth = fees.accruedEth + fees.accruedPengu > gasCostWei * BigInt(FEES.rebalanceGasMultiplier);
+    const priceChange = differencePercent(snapshot.priceScaled, position.lastPriceScaled);
+    const feesValue = snapshot.feesEth + snapshot.feesPengu;
+    const feesWorth = feesValue > gasCostWei * BigInt(FEES.rebalanceGasMultiplier);
 
-    if (priceOutOfRange) return { shouldRebalance: true, reason: 'PRICE_OUT_OF_RANGE' };
+    if (priceChange > FEES.priceThresholdPercent) return { shouldRebalance: true, reason: 'PRICE_DRIFT' };
     if (feesWorth) return { shouldRebalance: true, reason: 'FEES_HIGH' };
-    if (priceChange > FEES.priceThresholdPercent) return { shouldRebalance: true, reason: 'SIGNIFICANT_MOVE' };
     return { shouldRebalance: false, reason: null };
   }
+
+  async collectFees(position: LiquidityPosition, gasPriceWei: bigint): Promise<HarvestResult> {
+    if (position.lpTokenAmount === 0n) {
+      return { totalEth: 0n, totalPengu: 0n, fees: { accruedEth: 0n, accruedPengu: 0n, estimatedGasCostWei: 0n } };
+    }
+
+    const snapshot = await this.estimatePosition(position);
+    const balanceEthBefore: bigint = (await this.weth.balanceOf(this.signer.address)).toBigInt();
+    const balancePenguBefore: bigint = (await this.pengu.balanceOf(this.signer.address)).toBigInt();
+
+    const tx = await this.router.removeLiquidity(
+      TOKENS.eth.address,
+      TOKENS.pengu.address,
+      position.lpTokenAmount,
+      0,
+      0,
+      this.signer.address,
+      BigInt(now() + 600),
+      { gasPrice: gasPriceWei },
+    );
+    await tx.wait();
+
+    const balanceEthAfter: bigint = (await this.weth.balanceOf(this.signer.address)).toBigInt();
+    const balancePenguAfter: bigint = (await this.pengu.balanceOf(this.signer.address)).toBigInt();
+
+    const totalEth: bigint = balanceEthAfter - balanceEthBefore;
+    const totalPengu: bigint = balancePenguAfter - balancePenguBefore;
+    const feesEth: bigint = totalEth > position.depositedEth ? totalEth - position.depositedEth : 0n;
+    const feesPengu: bigint = totalPengu > position.depositedPengu ? totalPengu - position.depositedPengu : 0n;
+
+    const fees: FeeSnapshot = {
+      accruedEth: feesEth,
+      accruedPengu: feesPengu,
+      estimatedGasCostWei: gasPriceWei * 300000n,
+    };
+
+    position.lastCollectedFeesEth += feesEth;
+    position.lastCollectedFeesPengu += feesPengu;
+    position.lpTokenAmount = 0n;
+    position.depositedEth = 0n;
+    position.depositedPengu = 0n;
+    position.lastPriceScaled = snapshot.priceScaled;
+    position.lastHarvestTimestamp = now();
+
+    logger.info({ totalEth: totalEth.toString(), totalPengu: totalPengu.toString() }, 'LP liquidity withdrawn');
+    return { totalEth, totalPengu, fees };
+  }
+
+  async closePosition(position: LiquidityPosition, gasPriceWei: bigint): Promise<void> {
+    await this.collectFees(position, gasPriceWei);
+    logger.info('Closed LP position');
+  }
 }
+

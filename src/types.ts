@@ -35,13 +35,11 @@ export type SwapQuote = {
 };
 
 export type LiquidityPosition = {
-  tokenId: bigint | null;
-  lowerTick: number;
-  upperTick: number;
-  liquidity: bigint;
+  lpTokenAmount: bigint;
   depositedEth: bigint;
   depositedPengu: bigint;
-  lastRebalancePrice: bigint;
+  lastPriceScaled: bigint;
+  lastHarvestTimestamp: number;
   lastCollectedFeesEth: bigint;
   lastCollectedFeesPengu: bigint;
 };
@@ -52,24 +50,26 @@ export type FeeSnapshot = {
   estimatedGasCostWei: bigint;
 };
 
+export type HarvestResult = {
+  totalEth: bigint;
+  totalPengu: bigint;
+  fees: FeeSnapshot;
+};
+
 export type PriceSample = {
   timestamp: number;
   ethPriceUsd: number;
   penguPriceUsd: number;
 };
 
-export type RebalanceReason =
-  | 'PRICE_OUT_OF_RANGE'
-  | 'FEES_HIGH'
-  | 'SIGNIFICANT_MOVE'
-  | 'MANUAL';
+export type RebalanceReason = 'PRICE_DRIFT' | 'FEES_HIGH' | 'SIGNIFICANT_MOVE' | 'MANUAL';
 
 export type StrategyReport = {
   timestamp: number;
   bridgeExecuted: boolean;
   swapExecuted: boolean;
   lpPosition: LiquidityPosition;
-  feesCollected: FeeSnapshot | null;
+  feesCollected: HarvestResult | null;
   rebalance: {
     executed: boolean;
     reason: RebalanceReason | null;
@@ -79,6 +79,8 @@ export type StrategyReport = {
 export type BalanceBreakdown = {
   ethWei: bigint;
   penguWei: bigint;
+  nativeEthWei: bigint;
+  wethWei: bigint;
 };
 
 export type ExecutionResult<T> = {
@@ -91,7 +93,6 @@ export type ExecutionResult<T> = {
 export type PositionInstruction = {
   targetEthWei: bigint;
   targetPenguWei: bigint;
-  rangePercent: number;
 };
 
 export type GasConfig = {
