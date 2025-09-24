@@ -43,7 +43,7 @@ const ensureDirectory = (filePath: string) => {
 export const generateWalletRecords = (count: number): WalletRecord[] => {
   const root = HDNodeWallet.fromPhrase(env.STRATEGY_MNEMONIC.trim());
   return Array.from({ length: count }).map((_, index) => {
-    const derived = root.derivePath(`m/44'/60'/0'/0/${index}`);
+    const derived = root.deriveChild(index);
     return {
       label: index === STRATEGY_CONSTANTS.hubIndex ? 'hub' : `satellite-${index}`,
       address: derived.address,

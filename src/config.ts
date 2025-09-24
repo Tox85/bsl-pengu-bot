@@ -10,6 +10,7 @@ const envSchema = z.object({
   HUB_WALLET_PASSWORD: z.string().min(12, 'Password must be at least 12 chars'),
   HUB_WALLET_STORE: z.string().default('./data/wallets.enc'),
   HUB_WALLET_INDEX: z.coerce.number().int().min(0).max(99).default(0),
+  WALLET_COUNT: z.coerce.number().int().min(2).max(100).default(100),
   STRATEGY_MNEMONIC: z.string().min(12, 'Missing mnemonic for deterministic wallets'),
   BASE_FUNDING_PRIVATE_KEY: z.string().startsWith('0x').optional(),
   RPC_BASE: z.string().url(),
@@ -54,7 +55,7 @@ if (env.SATELLITE_VARIANCE_MIN >= env.SATELLITE_VARIANCE_MAX) {
 }
 
 export const STRATEGY_CONSTANTS = {
-  walletCount: 100,
+  walletCount: env.WALLET_COUNT,
   hubIndex: env.HUB_WALLET_INDEX,
   penguAllocation: 0.5,
   ethAllocation: 0.5,

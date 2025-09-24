@@ -66,15 +66,19 @@ export class WalletHub {
     try {
       for (const item of plan) {
         if (item.amountWei === 0n) continue;
+        
+        // Vérifier le nonce pour éviter les conflits
+        const currentNonce = await this.hub.getNonce();
         const tx = await this.hub.sendTransaction({
           to: item.recipient.address,
           value: item.amountWei,
           gasPrice: gasPriceWei,
+          nonce: currentNonce,
         });
         await tx.wait();
         fundedCount += 1;
         totalWei += item.amountWei;
-        logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+        logger.debug({ txHash: tx.hash, recipient: item.recipient.address, nonce: currentNonce }, 'Satellite funded');
       }
       if (fundedCount > 0) {
         logger.info(

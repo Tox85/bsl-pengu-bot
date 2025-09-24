@@ -94,28 +94,157 @@ export class StrategyRunner {
     await this.walletHub.executeDistribution(plan, gasPrice);
 
     let bridgeExecuted = false;
-    const strategyAllocation = plan[0]?.amountWei ?? 0n;
-    if (strategyAllocation > 0n) {
-      const quote = await this.bridge.fetchQuote(strategyAllocation);
-      const result = await this.bridge.executeBridge(quote);
-      bridgeExecuted = result.success;
+    let bridgeAmountWei = 0n;
+    
+    // Vérifier d'abord les fonds existants sur Abstract
+    const existingBalances = await this.swap.getTokenBalances();
+    if (existingBalances.ethWei > 0n) {
+      logger.info({ 
+        existingEth: fromWei(existingBalances.ethWei),
+        message: 'Fonds existants détectés sur Abstract, bridge non nécessaire'
+      });
+      bridgeExecuted = true; // Considérer comme "réussi" car on a déjà des fonds
+      bridgeAmountWei = existingBalances.ethWei;
+    } else {
+      // Essayer de bridger les nouveaux fonds
+      const strategyAllocation = plan[0]?.amountWei ?? 0n;
+      const minBridgeAmount = toWei(0.0001); // Minimum 0.0001 ETH pour LiFi (réduit)
+      
+      if (strategyAllocation >= minBridgeAmount) {
+        try {
+          const quote = await this.bridge.fetchQuote(strategyAllocation);
+          const result = await this.bridge.executeBridge(quote);
+          
+          if (result.success && result.txHash) {
+            // Attendre que le bridge soit reçu sur Abstract
+            try {
+              await this.bridge.waitUntilReceived(result.txHash, 600_000); // 10 minutes
+              bridgeExecuted = true;
+              bridgeAmountWei = strategyAllocation;
+              logger.info({ 
+                amount: fromWei(strategyAllocation),
+                txHash: result.txHash,
+                message: 'Bridge exécuté et reçu avec succès'
+              });
+            } catch (error) {
+              logger.error({ 
+                err: error,
+                txHash: result.txHash,
+                message: 'Bridge soumis mais pas reçu dans les temps'
+              });
+              bridgeExecuted = false;
+              bridgeAmountWei = 0n;
+            }
+          } else {
+            logger.warn({ 
+              error: result.error?.message,
+              message: 'Bridge échoué, continuer avec les fonds existants'
+            });
+            bridgeExecuted = false;
+            bridgeAmountWei = 0n;
+          }
+        } catch (error) {
+          logger.error({ 
+            err: error,
+            message: 'Erreur lors du bridge, continuer sans bridge'
+          });
+          bridgeExecuted = false;
+          bridgeAmountWei = 0n;
+        }
+      } else {
+        // Si on a des fonds mais pas assez pour le bridge normal, essayer quand même
+        if (strategyAllocation > 0n) {
+          logger.warn({ 
+            allocation: fromWei(strategyAllocation),
+            minimum: fromWei(minBridgeAmount),
+            message: 'Montant faible mais tentative de bridge quand même'
+          });
+          
+          try {
+            const quote = await this.bridge.fetchQuote(strategyAllocation);
+            const result = await this.bridge.executeBridge(quote);
+            bridgeExecuted = result.success;
+            bridgeAmountWei = result.success ? strategyAllocation : 0n;
+            
+            if (result.success) {
+              logger.info({ 
+                amount: fromWei(strategyAllocation),
+                message: 'Bridge réussi avec montant faible'
+              });
+            } else {
+              logger.warn({ 
+                error: result.error?.message,
+                message: 'Bridge échoué avec montant faible'
+              });
+            }
+          } catch (error) {
+            logger.warn({ 
+              err: error,
+              message: 'Bridge échoué, continuer sans bridge'
+            });
+            bridgeExecuted = false;
+            bridgeAmountWei = 0n;
+          }
+        } else {
+          logger.warn({ 
+            allocation: fromWei(strategyAllocation),
+            minimum: fromWei(minBridgeAmount),
+            message: 'Aucun fonds à bridger'
+          });
+          bridgeExecuted = false;
+          bridgeAmountWei = 0n;
+        }
+      }
     }
+    
     summary.bridge.executed = bridgeExecuted;
-    summary.bridge.amountWei = strategyAllocation;
-    if (!bridgeExecuted && strategyAllocation === 0n) {
-      logger.warn('Strategy wallet received no new funds; proceeding with existing balances');
-    }
+    summary.bridge.amountWei = bridgeAmountWei;
 
     const balancesBeforeSwap = await this.swap.getTokenBalances();
     let swapExecuted = false;
+    
+    // Calculer le montant minimum pour un swap viable (inclut les frais de gas)
+    const minSwapAmount = gasPrice * 100000n; // Réserve réduite pour les frais de gas futurs
+    
     if (balancesBeforeSwap.ethWei > 0n) {
       const halfEth = balancesBeforeSwap.ethWei / 2n;
+      // Essayer le swap même avec des montants faibles
       if (halfEth > 0n) {
-        await this.swap.ensureWethBalance(halfEth, balancesBeforeSwap.nativeEthWei);
-        const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
-        const swapResult = await this.swap.executeSwap(quote);
-        swapExecuted = swapResult.success;
+        try {
+          await this.swap.ensureWethBalance(halfEth, balancesBeforeSwap.nativeEthWei);
+          const quote = await this.swap.fetchQuote(TOKENS.eth.address, TOKENS.pengu.address, halfEth);
+          const swapResult = await this.swap.executeSwap(quote);
+          swapExecuted = swapResult.success;
+          
+          if (swapResult.success) {
+            logger.info({ 
+              amount: fromWei(halfEth),
+              message: 'Swap ETH vers PENGU exécuté avec succès'
+            });
+          } else {
+            logger.warn({ 
+              error: swapResult.error?.message,
+              message: 'Swap échoué, continuer sans swap'
+            });
+          }
+        } catch (error) {
+          logger.error({ 
+            err: error,
+            message: 'Erreur lors du swap, continuer sans swap'
+          });
+          swapExecuted = false;
+        }
+      } else {
+        logger.warn({ 
+          available: fromWei(balancesBeforeSwap.ethWei),
+          message: 'Montant insuffisant pour un swap'
+        });
       }
+    } else {
+      logger.warn({ 
+        available: fromWei(balancesBeforeSwap.ethWei),
+        message: 'Aucun fonds ETH disponible pour le swap'
+      });
     }
 
     let balances = await this.swap.getTokenBalances();
@@ -147,8 +276,31 @@ export class StrategyRunner {
         targetEthWei: scaleByPercent(availableWeth, STRATEGY_CONSTANTS.liquidityUtilizationPercent),
         targetPenguWei: scaleByPercent(availablePengu, STRATEGY_CONSTANTS.liquidityUtilizationPercent),
       };
+      
+      // Vérifier que nous avons suffisamment de fonds pour créer une position LP
+      const minLpAmount = gasPrice * 200000n; // Minimum réduit pour une position LP viable
+      
       if (instruction.targetEthWei > 0n && instruction.targetPenguWei > 0n) {
-        this.position = await this.lpManager.createPosition(instruction, gasPrice);
+        try {
+          this.position = await this.lpManager.createPosition(instruction, gasPrice);
+          logger.info({ 
+            ethAmount: fromWei(instruction.targetEthWei),
+            penguAmount: fromWei(instruction.targetPenguWei),
+            message: 'Position LP créée avec succès'
+          });
+        } catch (error) {
+          logger.error({ 
+            err: error,
+            message: 'Erreur lors de la création de la position LP'
+          });
+          this.position = null;
+        }
+      } else {
+        logger.warn({ 
+          ethAmount: fromWei(instruction.targetEthWei),
+          penguAmount: fromWei(instruction.targetPenguWei),
+          message: 'Fonds insuffisants pour créer une position LP (besoin de ETH et PENGU)'
+        });
       }
     } else {
       const snapshot = await this.lpManager.estimatePosition(this.position);
@@ -179,6 +331,16 @@ export class StrategyRunner {
       } else {
         this.position.lastPriceScaled = snapshot.priceScaled;
       }
+    }
+    
+    // Logique de continuation : si on n'a pas de position LP mais qu'on a des fonds, 
+    // essayer de créer une position plus tard ou attendre plus de fonds
+    if (!this.position && (availableWeth > 0n || availablePengu > 0n)) {
+      logger.info({ 
+        wethBalance: fromWei(availableWeth),
+        penguBalance: fromWei(availablePengu),
+        message: 'Fonds disponibles mais position LP non créée, sera retenté au prochain cycle'
+      });
     }
 
     const activePosition: LiquidityPosition =
