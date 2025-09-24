@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import { logger } from './logger.js';
 import { StrategyRunner } from './strategy.js';
+import { fromWei } from './utils.js';
 
 const program = new Command();
 
@@ -16,8 +17,13 @@ program
   .action(async () => {
     try {
       const runner = new StrategyRunner();
-      const report = await runner.executeCycle();
-      logger.info({ report }, 'Strategy cycle completed');
+      await runner.executeCycle();
+      const summary = runner.getLatestSummary();
+      if (summary) {
+        logger.info({ summary }, 'Strategy cycle completed');
+      } else {
+        logger.info('Strategy cycle completed');
+      }
     } catch (error) {
       logger.error({ err: error }, 'Strategy cycle failed');
       process.exitCode = 1;
@@ -31,7 +37,13 @@ program
     try {
       const runner = new StrategyRunner();
       const balances = await runner.getStrategyBalances();
-      logger.info({ balances }, 'Current strategy balances');
+      const readable = {
+        totalEth: fromWei(balances.ethWei),
+        pengu: fromWei(balances.penguWei),
+        nativeEth: fromWei(balances.nativeEthWei),
+        weth: fromWei(balances.wethWei),
+      };
+      logger.info({ balances: readable }, 'Current strategy balances');
     } catch (error) {
       logger.error({ err: error }, 'Unable to fetch balances');
       process.exitCode = 1;

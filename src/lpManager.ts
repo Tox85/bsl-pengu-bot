@@ -11,7 +11,7 @@ import type {
   PositionInstruction,
   RebalanceReason,
 } from './types.js';
-import { differencePercent, now } from './utils.js';
+import { differencePercent, now, fromWei } from './utils.js';
 import { logger } from './logger.js';
 
 const ROUTER_ABI = [
@@ -115,7 +115,7 @@ export class LPManager {
     if (shortfall === 0n) return;
     const tx = await this.weth.deposit({ value: shortfall });
     await tx.wait();
-    logger.info({ amountWei: shortfall.toString() }, 'Wrapped native ETH into WETH');
+    logger.info({ amountEth: fromWei(shortfall) }, 'Wrapped native ETH into WETH for LP');
   }
 
   private async shareForLpTokens(lpTokens: bigint) {
@@ -183,7 +183,14 @@ export class LPManager {
       lastCollectedFeesPengu: 0n,
     };
 
-    logger.info({ minted: minted.toString() }, 'LP position created on Uniswap v2 pair');
+    logger.info(
+      {
+        minted: minted.toString(),
+        depositedEth: fromWei(ethShare),
+        depositedPengu: fromWei(penguShare),
+      },
+      'LP position created on Uniswap v2 pair',
+    );
     return position;
   }
 
@@ -260,7 +267,10 @@ export class LPManager {
     position.lastPriceScaled = snapshot.priceScaled;
     position.lastHarvestTimestamp = now();
 
-    logger.info({ totalEth: totalEth.toString(), totalPengu: totalPengu.toString() }, 'LP liquidity withdrawn');
+    logger.info(
+      { totalEth: fromWei(totalEth), totalPengu: fromWei(totalPengu) },
+      'LP liquidity withdrawn',
+    );
     return { totalEth, totalPengu, fees };
   }
 

@@ -12,8 +12,7 @@ Bot TypeScript minimaliste pour exécuter le flow complet demandé :
 - Bridge ETH Base → Abstract via l'API Jumper, puis swap 50/50 ETH/PENGU.
 - Fourniture de liquidité Uniswap **v2** (pool PENGU/WETH) en déployant ~80% de chaque jeton.
 - Collecte conditionnelle des fees (drift de prix, fees > 3× gas) puis recyclage partiel en ETH pour la sécurité.
-- CLI unique (`npm start -- cycle`) pour lancer un cycle complet.
-- CLI unique (`npm start -- cycle`) pour lancer un cycle complet.
+- Logs synthétiques (funding, bridge, swap, LP) pour vérifier un cycle en quelques lignes.
 
 ## 🗂️ Structure ultra-compacte
 
@@ -53,25 +52,49 @@ Variables obligatoires :
 ```bash
 npm install
 cp env.example .env
-# éditer .env avec vos valeurs
-
-# Build + run un cycle complet
-npm run build
-node dist/index.js cycle
-# ou directement en dev (ts-node via tsup --watch)
-npx ts-node src/index.ts cycle
-
-# Consulter les balances du wallet stratégie (Abstract)
-node dist/index.js balances
+# puis éditez .env avec vos paramètres (voir ci-dessous)
 ```
 
-Le cycle exécute :
+### Lancement standard (Bybit → Hub → 99 wallets)
+
+```bash
+# 1. Construire le CLI
+npm run build
+
+# 2. Lancer un cycle complet (retrait Bybit, distribution, bridge, swap, LP)
+npm start -- cycle
+
+# 3. Vérifier les balances du wallet stratégie (réseau Abstract)
+npm start -- balances
+```
+
+Le cycle exécute automatiquement :
 1. Retrait Bybit (ou transfert depuis le wallet Base) vers le hub.
 2. Distribution aléatoire du hub vers les 99 satellites (dont le wallet stratégie).
 3. Bridge du satellite stratégique → Abstract.
 4. Swap pour obtenir ~50% WETH / 50% PENGU.
 5. Dépôt d'~80% de chaque jeton dans le pool Uniswap v2 PENGU/WETH.
 6. Collecte conditionnelle des fees + décision de redeploiement.
+
+### Mode wallet unitaire (sans API Bybit)
+
+Pour un dry-run depuis un seul wallet Base :
+
+1. Laissez `BYBIT_API_KEY` / `BYBIT_API_SECRET` vides.
+2. Renseignez `BASE_FUNDING_PRIVATE_KEY` avec la clé privée du wallet Base à utiliser.
+3. Lancer `npm run build && npm start -- cycle`.
+
+Le bot :
+
+- alimente le hub depuis ce wallet unique,
+- crée (ou recharge) les 99 wallets dérivés via la mnemonic,
+- continue le flow complet (bridge, swap, LP) sans dépendance à Bybit.
+
+### Logs & monitoring
+
+- Niveau par défaut : `info` (configurable via `LOG_LEVEL`).
+- Chaque cycle affiche un résumé unique : source de funding, montant distribué, bridge/swap exécutés, état de la LP et fees récoltées.
+- Les détails transactionnels restent disponibles au niveau `debug` (transferts satellites, retour de fonds, etc.).
 
 ## 🔁 Stratégie de harvest / redeploiement
 
@@ -92,6 +115,7 @@ Lorsque l'une de ces conditions est remplie :
 - Les 100 wallets sont dérivés depuis `STRATEGY_MNEMONIC` (`m/44'/60'/0'/0/i`).
 - Chiffrement AES-256-GCM, clé dérivée via `scrypt` + salt unique.
 - Relancer le bot recharge automatiquement les wallets existants. Modifier `HUB_WALLET_INDEX` permet de choisir le hub à whitelister.
+- Les montants envoyés aux satellites sont randomisés dans l'intervalle `[SATELLITE_VARIANCE_MIN, SATELLITE_VARIANCE_MAX]` pour éviter des patterns fixes.
 
 ## 🧪 Tests & lint
 

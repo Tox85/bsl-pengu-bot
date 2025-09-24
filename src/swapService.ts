@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Contract, JsonRpcProvider, Wallet } from 'ethers';
 import { NETWORKS, TOKENS, env, STRATEGY_CONSTANTS } from './config.js';
 import type { BalanceBreakdown, ExecutionResult, SwapQuote } from './types.js';
-import { applySlippageBps, calculateAllocation } from './utils.js';
+import { applySlippageBps, calculateAllocation, fromWei } from './utils.js';
 import { logger } from './logger.js';
 
 const JUMPER_BASE_URL = 'https://api.jumper.exchange/v1';
@@ -96,7 +96,7 @@ export class SwapService {
     if (amountWei <= 0n) return;
     const tx = await this.weth.deposit({ value: amountWei });
     await tx.wait();
-    logger.info({ amountWei: amountWei.toString() }, 'Wrapped native ETH into WETH');
+    logger.info({ amountEth: fromWei(amountWei) }, 'Wrapped native ETH into WETH');
   }
 
   async ensureWethBalance(targetWei: bigint, maxWrapFromNative?: bigint) {

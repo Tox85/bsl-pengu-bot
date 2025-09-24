@@ -3,6 +3,7 @@ import { JsonRpcProvider, Wallet, parseUnits } from 'ethers';
 import { DISTRIBUTION_VARIANCE, NETWORKS } from './config.js';
 import type { DistributionPlan, ExecutionResult, HubWalletState } from './types.js';
 import { logger } from './logger.js';
+import { fromWei } from './utils.js';
 
 export class WalletHub {
   private readonly provider: JsonRpcProvider;
@@ -55,6 +56,13 @@ export class WalletHub {
   }
 
   async executeDistribution(plan: DistributionPlan[], gasPriceWei: bigint): Promise<ExecutionResult<void>> {
+    if (plan.length === 0) {
+      logger.info('No satellites funded this cycle (empty plan)');
+      return { success: true };
+    }
+
+    let fundedCount = 0;
+    let totalWei = 0n;
     try {
       for (const item of plan) {
         if (item.amountWei === 0n) continue;
@@ -64,7 +72,17 @@ export class WalletHub {
           gasPrice: gasPriceWei,
         });
         await tx.wait();
-        logger.info({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+        fundedCount += 1;
+        totalWei += item.amountWei;
+        logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
+      }
+      if (fundedCount > 0) {
+        logger.info(
+          { fundedCount, totalEth: fromWei(totalWei) },
+          'Satellite distribution completed',
+        );
+      } else {
+        logger.info('Distribution plan contained only zero-value transfers');
       }
       return { success: true };
     } catch (error) {
@@ -74,6 +92,8 @@ export class WalletHub {
   }
 
   async topUpHubFromSatellites(minBalanceWei: bigint, gasPriceWei: bigint) {
+    let returned = 0;
+    let totalWei = 0n;
     for (const satellite of this.satellites) {
       const balance = await this.provider.getBalance(satellite.address);
       if (balance < minBalanceWei) continue;
@@ -83,7 +103,15 @@ export class WalletHub {
         gasPrice: gasPriceWei,
       });
       await tx.wait();
-      logger.info({ from: satellite.address, txHash: tx.hash }, 'Returned residual funds to hub');
+      returned += 1;
+      totalWei += balance - parseUnits('0.0001', 18);
+      logger.debug({ from: satellite.address, txHash: tx.hash }, 'Returned residual funds to hub');
+    }
+    if (returned > 0) {
+      logger.info(
+        { returnedCount: returned, totalEth: fromWei(totalWei) },
+        'Residual funds consolidated back to hub',
+      );
     }
   }
 
@@ -96,7 +124,10 @@ export class WalletHub {
         gasPrice: gasPriceWei,
       });
       await tx.wait();
-      logger.info({ txHash: tx.hash, from: external.address }, 'Funded hub directly from base wallet');
+      logger.info(
+        { txHash: tx.hash, from: external.address, amountEth: fromWei(amountWei) },
+        'Funded hub directly from base wallet',
+      );
       return { success: true, txHash: tx.hash };
     } catch (error) {
       logger.error({ err: error }, 'Failed to fund hub from external wallet');

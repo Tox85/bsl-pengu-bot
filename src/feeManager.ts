@@ -2,6 +2,7 @@ import type { BalanceBreakdown, FeeSnapshot } from './types.js';
 import { STRATEGY_CONSTANTS, TOKENS } from './config.js';
 import { logger } from './logger.js';
 import { SwapService } from './swapService.js';
+import { fromWei } from './utils.js';
 
 const scalePercent = (value: bigint, percent: number): bigint => {
   const bps = BigInt(Math.round(percent * 100));
@@ -26,7 +27,10 @@ export class FeeManager {
 
     const reinvestEth = scalePercent(fees.accruedEth + swappedEth, STRATEGY_CONSTANTS.feeReinvestPercent * 100);
     const reinvestPengu = scalePercent(fees.accruedPengu - penguToSwap, STRATEGY_CONSTANTS.feeReinvestPercent * 100);
-    logger.info({ reinvestEth, reinvestPengu }, 'Fees recycled for compounding');
+    logger.info(
+      { reinvestEth: fromWei(reinvestEth), reinvestPengu: fromWei(reinvestPengu) },
+      'Fees recycled for compounding',
+    );
     return {
       ethWei: reinvestEth,
       penguWei: reinvestPengu,

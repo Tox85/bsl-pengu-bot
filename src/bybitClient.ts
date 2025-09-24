@@ -33,7 +33,10 @@ export class BybitClient {
       const response = await this.client.withdraw('ETH', Number(amount), address, undefined, {
         chain: 'ETH',
       });
-      logger.info({ response }, 'Bybit withdrawal initiated');
+      logger.info(
+        { txId: response?.id, amountEth: amount, recipient: address },
+        'Bybit withdrawal initiated',
+      );
       return { success: true, data: undefined, txHash: response?.id };
     } catch (error) {
       logger.error({ err: error }, 'Failed to withdraw from Bybit');
