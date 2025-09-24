@@ -22,6 +22,9 @@ export type BridgeQuote = {
   txData: string;
   txTarget: AddressLike;
   gasEstimate: bigint;
+  txValueWei?: bigint;
+  gasLimit?: bigint;
+  gasPriceWei?: bigint;
 };
 
 export type SwapQuote = {
@@ -32,6 +35,7 @@ export type SwapQuote = {
   calldata: string;
   target: AddressLike;
   valueWei: bigint;
+  allowanceTarget?: string;
 };
 
 export type LiquidityPosition = {

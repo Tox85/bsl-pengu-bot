@@ -55,10 +55,13 @@ export class WalletHub {
     }));
   }
 
-  async executeDistribution(plan: DistributionPlan[], gasPriceWei: bigint): Promise<ExecutionResult<void>> {
+  async executeDistribution(
+    plan: DistributionPlan[],
+    gasPriceWei: bigint,
+  ): Promise<ExecutionResult<{ fundedCount: number; totalWei: bigint }>> {
     if (plan.length === 0) {
       logger.info('No satellites funded this cycle (empty plan)');
-      return { success: true };
+      return { success: true, data: { fundedCount: 0, totalWei: 0n } };
     }
 
     let fundedCount = 0;
@@ -66,14 +69,33 @@ export class WalletHub {
     try {
       for (const item of plan) {
         if (item.amountWei === 0n) continue;
+        const balance = await this.provider.getBalance(this.hub.address);
+        const gasReserve = gasPriceWei * 25_000n;
+        if (balance <= gasReserve) {
+          logger.warn('Hub balance too low to continue distribution');
+          break;
+        }
+        const maxSendable = balance - gasReserve;
+        const value = item.amountWei > maxSendable ? maxSendable : item.amountWei;
+        if (value <= 0n) continue;
+        if (value !== item.amountWei) {
+          logger.warn(
+            {
+              requested: fromWei(item.amountWei),
+              adjusted: fromWei(value),
+            },
+            'Adjusted satellite funding amount to preserve gas',
+          );
+        }
         const tx = await this.hub.sendTransaction({
           to: item.recipient.address,
-          value: item.amountWei,
+          value,
           gasPrice: gasPriceWei,
         });
         await tx.wait();
         fundedCount += 1;
-        totalWei += item.amountWei;
+        totalWei += value;
+        item.amountWei = value;
         logger.debug({ txHash: tx.hash, recipient: item.recipient.address }, 'Satellite funded');
       }
       if (fundedCount > 0) {
@@ -84,7 +106,7 @@ export class WalletHub {
       } else {
         logger.info('Distribution plan contained only zero-value transfers');
       }
-      return { success: true };
+      return { success: true, data: { fundedCount, totalWei } };
     } catch (error) {
       logger.error({ err: error }, 'Failed to execute distribution');
       return { success: false, error: error as Error };
@@ -118,14 +140,30 @@ export class WalletHub {
   async fundHubFromExternal(privateKey: string, amountWei: bigint, gasPriceWei: bigint): Promise<ExecutionResult<void>> {
     try {
       const external = new Wallet(privateKey, this.provider);
+      const balance = await this.provider.getBalance(external.address);
+      const gasReserve = gasPriceWei * 25_000n;
+      if (balance <= gasReserve) {
+        throw new Error('External wallet balance too low to cover gas costs');
+      }
+      const maxSendable = balance - gasReserve;
+      const value = amountWei > maxSendable ? maxSendable : amountWei;
+      if (value <= 0n) {
+        throw new Error('Requested funding amount exceeds available balance after gas reserve');
+      }
+      if (value !== amountWei) {
+        logger.warn(
+          { requested: fromWei(amountWei), adjusted: fromWei(value) },
+          'Adjusted hub funding amount to fit available balance',
+        );
+      }
       const tx = await external.sendTransaction({
         to: this.hub.address,
-        value: amountWei,
+        value,
         gasPrice: gasPriceWei,
       });
       await tx.wait();
       logger.info(
-        { txHash: tx.hash, from: external.address, amountEth: fromWei(amountWei) },
+        { txHash: tx.hash, from: external.address, amountEth: fromWei(value) },
         'Funded hub directly from base wallet',
       );
       return { success: true, txHash: tx.hash };

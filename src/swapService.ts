@@ -5,42 +5,64 @@ import type { BalanceBreakdown, ExecutionResult, SwapQuote } from './types.js';
 import { applySlippageBps, calculateAllocation, fromWei } from './utils.js';
 import { logger } from './logger.js';
 
-const JUMPER_BASE_URL = 'https://api.jumper.exchange/v1';
-const ERC20_ABI = ['function balanceOf(address owner) view returns (uint256)'];
-const WETH_ABI = [
+const LIFI_BASE_URL = 'https://li.quest/v1';
+const LIFI_NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
-  'function deposit() payable',
+  'function allowance(address owner, address spender) view returns (uint256)',
+  'function approve(address spender, uint256 value) returns (bool)',
 ];
+const WETH_ABI = [...ERC20_ABI, 'function deposit() payable'];
+const MAX_ALLOWANCE = (1n << 256n) - 1n;
 
 export class SwapService {
   private readonly provider: JsonRpcProvider;
   private readonly signer: Wallet;
   private readonly weth: Contract;
   private readonly pengu: Contract;
+  private readonly tokenContracts: Map<string, Contract>;
 
   constructor(privateKey: string) {
     this.provider = new JsonRpcProvider(NETWORKS.abstract.rpcUrl, NETWORKS.abstract.chainId);
     this.signer = new Wallet(privateKey, this.provider);
     this.weth = new Contract(TOKENS.eth.address, WETH_ABI, this.signer);
-    this.pengu = new Contract(TOKENS.pengu.address, ERC20_ABI, this.provider);
+    this.pengu = new Contract(TOKENS.pengu.address, ERC20_ABI, this.signer);
+    this.tokenContracts = new Map([
+      [TOKENS.eth.address.toLowerCase(), this.weth],
+      [TOKENS.pengu.address.toLowerCase(), this.pengu],
+    ]);
   }
 
   async fetchQuote(tokenIn: string, tokenOut: string, amountWei: bigint): Promise<SwapQuote> {
+    if (amountWei <= 0n) {
+      throw new Error('Cannot fetch swap quote for zero amount');
+    }
+
     const params = {
       fromChain: NETWORKS.abstract.chainId,
       toChain: NETWORKS.abstract.chainId,
       fromToken: tokenIn,
       toToken: tokenOut,
-      amount: amountWei.toString(),
+      fromAmount: amountWei.toString(),
       slippage: env.SWAP_SLIPPAGE_BPS / 100,
-      integratorId: 'bsl-pengu-bot-swap',
+      integrator: 'bsl-pengu-bot',
     } as const;
 
-    const { data } = await axios.get(`${JUMPER_BASE_URL}/quote`, { params });
-    const route = data?.routes?.[0];
-    if (!route) throw new Error('Unable to fetch swap quote from Jumper');
-    const tx = route.transactionRequest;
-    const minAmount = applySlippageBps(BigInt(route.estimate.toAmountMin ?? route.estimate.toAmount), env.SWAP_SLIPPAGE_BPS);
+    const { data } = await axios.get(`${LIFI_BASE_URL}/quote`, { params });
+    const tx = data?.transactionRequest;
+    if (!tx) throw new Error('Unable to fetch swap quote from LiFi');
+    const minAmountRaw = data?.estimate?.toAmountMin ?? data?.estimate?.toAmount;
+    if (!minAmountRaw) {
+      throw new Error('LiFi swap quote missing minimum amount estimate');
+    }
+
+    const minAmount = applySlippageBps(BigInt(minAmountRaw), env.SWAP_SLIPPAGE_BPS);
+    const valueWei = typeof tx.value === 'string' ? BigInt(tx.value) : BigInt(tx.value ?? 0);
+    const allowanceTarget = data?.estimate?.approvalAddress ?? undefined;
+    if (!tx.to || !tx.data) {
+      throw new Error('LiFi swap quote missing transaction request details');
+    }
+
     return {
       tokenIn,
       tokenOut,
@@ -48,12 +70,16 @@ export class SwapService {
       minAmountOutWei: minAmount,
       calldata: tx.data,
       target: tx.to,
-      valueWei: BigInt(tx.value ?? 0),
+      valueWei,
+      allowanceTarget,
     } satisfies SwapQuote;
   }
 
   async executeSwap(quote: SwapQuote): Promise<ExecutionResult<void>> {
     try {
+      if (quote.allowanceTarget && quote.tokenIn.toLowerCase() !== LIFI_NATIVE_TOKEN.toLowerCase()) {
+        await this.ensureAllowance(quote.tokenIn, quote.allowanceTarget, quote.amountInWei);
+      }
       const tx = await this.signer.sendTransaction({
         to: quote.target,
         data: quote.calldata,
@@ -108,5 +134,20 @@ export class SwapService {
     if (wrapAmount > 0n) {
       await this.wrapNative(wrapAmount);
     }
+  }
+
+  private getTokenContract(address: string): Contract | null {
+    return this.tokenContracts.get(address.toLowerCase()) ?? null;
+  }
+
+  private async ensureAllowance(tokenAddress: string, spender: string, amountWei: bigint) {
+    if (!spender) return;
+    const token = this.getTokenContract(tokenAddress);
+    if (!token) return;
+    const currentAllowance = (await token.allowance(this.signer.address, spender)).toBigInt();
+    if (currentAllowance >= amountWei) return;
+    const tx = await token.approve(spender, MAX_ALLOWANCE);
+    await tx.wait();
+    logger.info({ token: tokenAddress, spender, txHash: tx.hash }, 'Approved token allowance for swap');
   }
 }
