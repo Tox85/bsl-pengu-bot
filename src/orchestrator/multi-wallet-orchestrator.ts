@@ -5,11 +5,12 @@ import { HubDistributor, type HubDistributionConfig } from '../cex/hub-distribut
 import { CONSTANTS, cfg } from '../config/env.js';
 import { buildContext, type BotContext } from '../core/context.js';
 import { OrchestratorService } from './run.js';
-import type { 
-  OrchestratorParams, 
-  OrchestratorResult, 
-  OrchestratorState 
+import type {
+  OrchestratorParams,
+  OrchestratorResult,
+  OrchestratorState
 } from './types.js';
+import { OrchestratorStep } from './types.js';
 
 /**
  * Configuration pour l'orchestrateur multi-wallet
@@ -143,6 +144,24 @@ export class MultiWalletOrchestrator {
         failedWallets: result.failedWallets,
         success: result.success,
         message: 'Orchestration multi-wallet terminée'
+      });
+
+      const walletSummaries = result.results.map(item => ({
+        wallet: item.wallet,
+        status: item.success ? 'success' : 'failed',
+        finalStep: item.result?.state.currentStep ?? OrchestratorStep.ERROR,
+        skippedReason: item.result?.state.collectResult?.skippedReason,
+        error: item.error || item.result?.error,
+      }));
+
+      logger.info({
+        message: 'Résumé multi-wallet',
+        totals: {
+          total: result.totalWallets,
+          success: result.successfulWallets,
+          failed: result.failedWallets,
+        },
+        wallets: walletSummaries,
       });
 
     } catch (error) {

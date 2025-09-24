@@ -58,6 +58,9 @@ const configSchema = z.object({
   DISTRIBUTION_ETH_PER_WALLET: z.number().positive().optional().default(0.005),
   DISTRIBUTION_RANDOMIZE_AMOUNTS: z.union([z.boolean(), z.string().transform(val => val === 'true')]).default(true),
   DISTRIBUTION_VARIATION_PERCENT: z.number().min(0).max(100).default(10),
+  HUB_WITHDRAW_AMOUNT: z.number().positive().optional().default(0.00002),
+  SATELLITE_VARIANCE_MIN: z.number().positive().optional().default(0.85),
+  SATELLITE_VARIANCE_MAX: z.number().positive().optional().default(1.15),
   
   // Nouvelles configurations
   NETWORK_WITHDRAW: z.string().default('ARBITRUM'),
@@ -79,6 +82,10 @@ const configSchema = z.object({
   SWAP_SLIPPAGE_BPS: bpsSchema.default(80),
   LP_RANGE_PCT: percentageSchema.default(5),
   LP_MINUTES_BEFORE_COLLECT: z.number().int().positive().default(10),
+  FEE_GAS_MULTIPLE_TRIGGER: z.number().int().min(1).max(10).default(3),
+  FEE_REINVEST_PERCENT: z.number().int().min(0).max(100).default(30),
+  PENGU_TO_ETH_FEE_SWAP_PERCENT: z.number().int().min(0).max(100).default(100),
+  LIQUIDITY_UTILIZATION_PERCENT: z.number().int().min(0).max(100).default(80),
       MIN_BRIDGE_USD: z.string().transform(val => parseFloat(val)).pipe(z.number().positive()).default("1"),
       MIN_SWAP_USD: z.string().transform(val => parseFloat(val)).pipe(z.number().positive()).default("5"),
       MIN_ABS_GAS_BUFFER_ETH: z.string().transform(val => parseFloat(val)).pipe(z.number().positive()).default("0.002"),
@@ -151,6 +158,9 @@ const transformConfig = (raw: Record<string, string | undefined>) => {
     DISTRIBUTION_ETH_PER_WALLET: parseFloat(raw.DISTRIBUTION_ETH_PER_WALLET || '0.005'),
     DISTRIBUTION_RANDOMIZE_AMOUNTS: raw.DISTRIBUTION_RANDOMIZE_AMOUNTS === 'true',
     DISTRIBUTION_VARIATION_PERCENT: parseFloat(raw.DISTRIBUTION_VARIATION_PERCENT || '10'),
+    HUB_WITHDRAW_AMOUNT: parseFloat(raw.HUB_WITHDRAW_AMOUNT || '0.00002'),
+    SATELLITE_VARIANCE_MIN: parseFloat(raw.SATELLITE_VARIANCE_MIN || '0.85'),
+    SATELLITE_VARIANCE_MAX: parseFloat(raw.SATELLITE_VARIANCE_MAX || '1.15'),
     
     // Nouvelles configurations
     WITHDRAW_ENABLED: raw.WITHDRAW_ENABLED === 'true',
@@ -164,6 +174,10 @@ const transformConfig = (raw: Record<string, string | undefined>) => {
     BYPASS_POLLING: raw.BYPASS_POLLING === 'true',
     POLLING_TIMEOUT_MS: parseInt(raw.POLLING_TIMEOUT_MS || '300000'),
     POLLING_INTERVAL_MS: parseInt(raw.POLLING_INTERVAL_MS || '10000'),
+    FEE_GAS_MULTIPLE_TRIGGER: parseInt(raw.FEE_GAS_MULTIPLE_TRIGGER || '3'),
+    FEE_REINVEST_PERCENT: parseInt(raw.FEE_REINVEST_PERCENT || '30'),
+    PENGU_TO_ETH_FEE_SWAP_PERCENT: parseInt(raw.PENGU_TO_ETH_FEE_SWAP_PERCENT || '100'),
+    LIQUIDITY_UTILIZATION_PERCENT: parseInt(raw.LIQUIDITY_UTILIZATION_PERCENT || '80'),
   };
 };
 
@@ -235,6 +249,13 @@ export const CONSTANTS = {
     MIN_NATIVE_DEST_WEI_FOR_SWAP: cfg.MIN_NATIVE_DEST_WEI_FOR_SWAP,
     AUTO_GAS_TOPUP: cfg.AUTO_GAS_TOPUP,
     GAS_TOPUP_TARGET_WEI: cfg.GAS_TOPUP_TARGET_WEI,
+    FEE_GAS_MULTIPLE_TRIGGER: cfg.FEE_GAS_MULTIPLE_TRIGGER,
+    FEE_REINVEST_PERCENT: cfg.FEE_REINVEST_PERCENT,
+    PENGU_TO_ETH_FEE_SWAP_PERCENT: cfg.PENGU_TO_ETH_FEE_SWAP_PERCENT,
+    LIQUIDITY_UTILIZATION_PERCENT: cfg.LIQUIDITY_UTILIZATION_PERCENT,
+    HUB_WITHDRAW_AMOUNT: cfg.HUB_WITHDRAW_AMOUNT,
+    SATELLITE_VARIANCE_MIN: cfg.SATELLITE_VARIANCE_MIN,
+    SATELLITE_VARIANCE_MAX: cfg.SATELLITE_VARIANCE_MAX,
 } as const;
 
 // Fonction utilitaire pour vérifier si on est en mode DRY_RUN
