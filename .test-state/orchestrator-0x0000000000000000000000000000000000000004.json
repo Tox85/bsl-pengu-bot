@@ -1,0 +1,14 @@
+{
+  "wallet": "0x0000000000000000000000000000000000000004",
+  "currentStep": "collect_done",
+  "createdAt": 1758621200071,
+  "updatedAt": 1758621200556,
+  "lpResult": {
+    "result": {
+      "hash": "0xlp0...",
+      "status": "success"
+    },
+    "attempts": 1,
+    "totalDelayMs": 0
+  }
+}

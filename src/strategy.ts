@@ -247,4 +247,57 @@ export class StrategyRunner {
       },
     } satisfies Record<string, unknown>;
   }
+
+  async executeCycleDryRun(): Promise<void> {
+    const withdrawAmountWei = toWei(env.HUB_WITHDRAW_AMOUNT);
+    const gasPrice = weiFromGwei(env.GAS_PRICE_GWEI);
+
+    logger.info('Starting DRY RUN strategy cycle (no real transactions)');
+
+    // Simulate funding
+    const fundingSource = this.bybit.isConfigured() ? 'BYBIT' : 
+                         env.BASE_FUNDING_PRIVATE_KEY ? 'BASE' : 'NONE';
+    
+    logger.info(`[DRY RUN] Funding source: ${fundingSource}`);
+    logger.info(`[DRY RUN] Requested amount: ${fromWei(withdrawAmountWei)} ETH`);
+
+    // Simulate distribution (without creating real wallets)
+    const hubBalance = withdrawAmountWei; // Simulate full funding
+    const satelliteCount = 99;
+    const avgPerWallet = hubBalance / BigInt(satelliteCount);
+    const fundedWallets = satelliteCount;
+    const totalDistributed = hubBalance;
+
+    logger.info(`[DRY RUN] Distribution: ${fundedWallets} wallets, ${fromWei(totalDistributed)} ETH total`);
+    logger.info(`[DRY RUN] Average per wallet: ${fromWei(avgPerWallet)} ETH`);
+
+    // Simulate bridge
+    const strategyAllocation = avgPerWallet; // First satellite gets average amount
+    if (strategyAllocation > 0n) {
+      logger.info(`[DRY RUN] Bridge: ${fromWei(strategyAllocation)} ETH Base → Abstract`);
+    } else {
+      logger.warn('[DRY RUN] No funds allocated to strategy wallet');
+    }
+
+    // Simulate swap
+    if (strategyAllocation > 0n) {
+      const halfEth = strategyAllocation / 2n;
+      logger.info(`[DRY RUN] Swap: ${fromWei(halfEth)} ETH → PENGU`);
+      logger.info(`[DRY RUN] Final balances: ${fromWei(halfEth)} ETH + ${fromWei(halfEth)} PENGU`);
+    }
+
+    // Simulate LP
+    if (strategyAllocation > 0n) {
+      const halfEth = strategyAllocation / 2n;
+      const utilization = scaleByPercent(halfEth, STRATEGY_CONSTANTS.liquidityUtilizationPercent);
+      logger.info(`[DRY RUN] LP Position: ${fromWei(utilization)} ETH + ${fromWei(utilization)} PENGU`);
+      logger.info(`[DRY RUN] Pool: PENGU/WETH on Uniswap V2`);
+    }
+
+    // Simulate fee collection
+    logger.info('[DRY RUN] Fee collection: Triggered when fees > 3× gas cost');
+    logger.info('[DRY RUN] Fee recycling: 30% PENGU → ETH, 60% reinvested');
+
+    logger.info('[DRY RUN] Cycle simulation completed successfully!');
+  }
 }

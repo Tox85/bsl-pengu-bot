@@ -118,14 +118,31 @@ export class WalletHub {
   async fundHubFromExternal(privateKey: string, amountWei: bigint, gasPriceWei: bigint): Promise<ExecutionResult<void>> {
     try {
       const external = new Wallet(privateKey, this.provider);
+      const balance = await external.provider.getBalance(external.address);
+      const gasLimit = 21000n; // Standard transfer gas limit
+      const gasCost = gasLimit * gasPriceWei;
+      const maxAmount = balance > gasCost ? balance - gasCost : 0n;
+      const actualAmount = maxAmount < amountWei ? maxAmount : amountWei;
+      
+      if (actualAmount === 0n) {
+        logger.warn({ 
+          balance: fromWei(balance), 
+          gasCost: fromWei(gasCost),
+          gasPriceGwei: Number(gasPriceWei) / 1e9,
+          gasLimit: Number(gasLimit)
+        }, 'Insufficient balance for funding');
+        return { success: false, error: new Error('Insufficient balance for funding') };
+      }
+
       const tx = await external.sendTransaction({
         to: this.hub.address,
-        value: amountWei,
+        value: actualAmount,
         gasPrice: gasPriceWei,
+        gasLimit: gasLimit,
       });
       await tx.wait();
       logger.info(
-        { txHash: tx.hash, from: external.address, amountEth: fromWei(amountWei) },
+        { txHash: tx.hash, from: external.address, amountEth: fromWei(actualAmount) },
         'Funded hub directly from base wallet',
       );
       return { success: true, txHash: tx.hash };
