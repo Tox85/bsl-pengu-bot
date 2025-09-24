@@ -250,6 +250,7 @@ describe('MultiWalletOrchestrator', () => {
         wallet: {} as any,
         index: 0,
         nonce: 0,
+        publicKey: '0x04742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
       };
 
       mockOrchestratorService.run.mockResolvedValue({
@@ -277,8 +278,9 @@ describe('MultiWalletOrchestrator', () => {
     it('devrait retourner les statistiques des wallets', () => {
       const mockStats = {
         totalWallets: 2,
-        walletAddresses: ['0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8', '0x842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9'],
-        nonceStats: { '0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8': 0, '0x842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9': 0 },
+        addresses: ['0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8', '0x842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9'],
+        publicKeys: ['0x04742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8', '0x04842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9'],
+        nonceStats: { '0x742d35cc6634c0532925a3b8d1b2b3b4c5d6e7f8': 0, '0x842d35cc6634c0532925a3b8d1b2b3b4c5d6e7f9': 0 },
       };
 
       mockWalletManager.getStats.mockReturnValue(mockStats);

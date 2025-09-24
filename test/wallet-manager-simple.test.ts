@@ -5,6 +5,12 @@ import { WalletManager } from '../src/core/wallet-manager.js';
 const mockWallet = {
   address: '0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
   privateKey: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+  publicKey: '0x04bfcab58fbd8c6f5f5d3b1782e46b408e5f1e7d512975a9f03d3bd6e10c7a8f17e5b6b7bde7f73c62f0bca6ecb3efa1b9bd8e5dcd7f2571c2cb2bfa7b4b5b6c',
+};
+
+const mockHdNode = {
+  privateKey: mockWallet.privateKey,
+  publicKey: mockWallet.publicKey,
 };
 
 const mockProvider = {
@@ -13,14 +19,31 @@ const mockProvider = {
 };
 
 // Mock ethers avec des fonctions mock simples
-vi.mock('ethers', () => ({
-  Wallet: {
-    fromPhrase: vi.fn(() => mockWallet),
-    createRandom: vi.fn(() => ({
+vi.mock('ethers', () => {
+  class MockWallet {
+    address = mockWallet.address;
+    privateKey = mockWallet.privateKey;
+    publicKey = mockWallet.publicKey;
+
+    constructor() {
+      return mockWallet;
+    }
+
+    static fromPhrase = vi.fn(() => mockWallet);
+    static createRandom = vi.fn(() => ({
       mnemonic: { phrase: 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about' },
-    })),
-  },
-}));
+    }));
+  }
+
+  return {
+    Wallet: MockWallet,
+    HDNodeWallet: {
+      fromPhrase: vi.fn(() => mockHdNode),
+    },
+    JsonRpcProvider: vi.fn(() => mockProvider),
+    getAddress: vi.fn((address: string) => address),
+  };
+});
 
 describe('WalletManager', () => {
   let walletManager: WalletManager;
@@ -42,6 +65,7 @@ describe('WalletManager', () => {
       expect(result.address).toBe(mockWallet.address);
       expect(result.index).toBe(0);
       expect(walletManager.hasWallet(mockWallet.address)).toBe(true);
+      expect(result.publicKey).toBe(mockWallet.publicKey);
     });
 
     it('devrait créer des wallets avec des index différents', () => {
@@ -70,6 +94,7 @@ describe('WalletManager', () => {
       expect(result.address).toBe(mockWallet.address);
       expect(result.index).toBe(5);
       expect(walletManager.hasWallet(mockWallet.address)).toBe(true);
+      expect(result.publicKey).toBe(mockWallet.publicKey);
     });
   });
 
@@ -173,8 +198,9 @@ describe('WalletManager', () => {
       const stats = walletManager.getStats();
 
       expect(stats.totalWallets).toBe(1);
-      expect(stats.walletAddresses).toHaveLength(1);
-      expect(stats.nonceStats).toHaveProperty(mockWallet.address);
+      expect(stats.addresses).toHaveLength(1);
+      expect(stats.publicKeys).toHaveLength(1);
+      expect(stats.nonceStats).toHaveProperty(mockWallet.address.toLowerCase());
     });
   });
 
@@ -195,6 +221,13 @@ describe('WalletManager', () => {
       const mnemonic = WalletManager.generateMnemonic();
       expect(typeof mnemonic).toBe('string');
       expect(mnemonic.split(' ')).toHaveLength(12);
+    });
+  });
+
+  describe('getPublicKeyFromMnemonic', () => {
+    it('devrait retourner la clé publique pour un index donné', () => {
+      const publicKey = walletManager.getPublicKeyFromMnemonic(testMnemonic, 0);
+      expect(publicKey).toBe(mockWallet.publicKey);
     });
   });
 });

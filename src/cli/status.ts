@@ -198,6 +198,7 @@ async function getWalletStatus(walletInfo: any, chains: string[]) {
     address: walletInfo.address,
     index: walletInfo.index,
     nonce: walletInfo.nonce,
+    publicKey: walletInfo.publicKey,
     balances: {},
     positions: {},
     errors: [],

@@ -10,6 +10,8 @@ export interface WalletInfo {
   wallet: any; // ethers.Wallet ou ethers.HDNodeWallet
   index: number;
   nonce: number;
+  publicKey: string;
+  derivationPath?: string;
 }
 
 /**
@@ -40,16 +42,19 @@ export class WalletManager {
    */
   addWallet(privateKey: string, index?: number): WalletInfo {
     const wallet = new ethers.Wallet(privateKey, this.provider);
-    const address = wallet.address;
-    
+    const address = ethers.getAddress(wallet.address);
+    const key = address.toLowerCase();
+
     const walletInfo: WalletInfo = {
       address,
       wallet,
-      index: index || this.wallets.size,
+      index: index ?? this.wallets.size,
       nonce: 0,
+      publicKey: wallet.publicKey,
+      derivationPath: undefined,
     };
 
-    this.wallets.set(address, walletInfo);
+    this.wallets.set(key, walletInfo);
     logger.info({
       address,
       index: walletInfo.index,
@@ -66,19 +71,22 @@ export class WalletManager {
     const { mnemonic, index, provider } = params;
     
     // Utiliser ethers v6 syntax pour créer le wallet avec le chemin de dérivation
-    const derivationPath = `m/44'/60'/0'/0/${index}`;
-    const hdNode = ethers.HDNodeWallet.fromPhrase(mnemonic, derivationPath);
+    const derivationPath = this.getDerivationPath(index);
+    const hdNode = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, derivationPath);
     const wallet = new ethers.Wallet(hdNode.privateKey, provider || this.provider);
-    const address = wallet.address;
-    
+    const address = ethers.getAddress(wallet.address);
+    const key = address.toLowerCase();
+
     const walletInfo: WalletInfo = {
       address,
       wallet,
       index,
       nonce: 0,
+      publicKey: wallet.publicKey,
+      derivationPath,
     };
 
-    this.wallets.set(address, walletInfo);
+    this.wallets.set(key, walletInfo);
     logger.info({
       address,
       index,
@@ -106,7 +114,7 @@ export class WalletManager {
    * Obtenir les adresses de tous les wallets
    */
   getWalletAddresses(): string[] {
-    return Array.from(this.wallets.keys());
+    return Array.from(this.wallets.values()).map((info) => info.address);
   }
 
   /**
@@ -284,11 +292,14 @@ export class WalletManager {
   getStats(): {
     totalWallets: number;
     addresses: string[];
+    publicKeys: string[];
     nonceStats: Record<string, number>;
   } {
+    const walletInfos = Array.from(this.wallets.values());
     return {
-      totalWallets: this.wallets.size,
-      addresses: Array.from(this.wallets.keys()),
+      totalWallets: walletInfos.length,
+      addresses: walletInfos.map((info) => info.address),
+      publicKeys: walletInfos.map((info) => info.publicKey),
       nonceStats: Object.fromEntries(this.nonceMap),
     };
   }
@@ -310,6 +321,22 @@ export class WalletManager {
    */
   static generateMnemonic(): string {
     return ethers.Wallet.createRandom().mnemonic!.phrase;
+  }
+
+  /**
+   * Obtenir la clé publique dérivée d'un mnémonique pour un index donné
+   */
+  getPublicKeyFromMnemonic(mnemonic: string, index: number = 0): string {
+    const derivationPath = this.getDerivationPath(index);
+    const hdNode = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, derivationPath);
+    return hdNode.publicKey;
+  }
+
+  /**
+   * Construire le chemin de dérivation standard pour un index
+   */
+  private getDerivationPath(index: number): string {
+    return `m/44'/60'/0'/0/${index}`;
   }
 }
 
