@@ -10,6 +10,7 @@ vi.mock('ethers', async () => {
   const mockWallet = {
     address: '0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
     privateKey: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+    publicKey: '0x04742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
   };
   
   return {
@@ -114,12 +115,14 @@ describe('HubDistributor', () => {
           wallet: {} as any,
           index: 0,
           nonce: 0,
+          publicKey: '0x04742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
         },
         {
           address: '0x842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9',
           wallet: {} as any,
           index: 1,
           nonce: 0,
+          publicKey: '0x04842d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F9',
         },
       ];
 
@@ -164,6 +167,7 @@ describe('HubDistributor', () => {
           wallet: {} as any,
           index: 0,
           nonce: 0,
+          publicKey: '0x04742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
         },
       ];
 
@@ -231,9 +235,9 @@ describe('HubDistributor', () => {
       
       // Créer des wallets de test
       const mockWallets: WalletInfo[] = [
-        { address: '0x1', wallet: {} as any, index: 0, nonce: 0 },
-        { address: '0x2', wallet: {} as any, index: 1, nonce: 0 },
-        { address: '0x3', wallet: {} as any, index: 2, nonce: 0 },
+        { address: '0x1', wallet: {} as any, index: 0, nonce: 0, publicKey: '0x041' },
+        { address: '0x2', wallet: {} as any, index: 1, nonce: 0, publicKey: '0x042' },
+        { address: '0x3', wallet: {} as any, index: 2, nonce: 0, publicKey: '0x043' },
       ];
 
       // Mock calculateRandomAmounts
@@ -293,8 +297,8 @@ describe('HubDistributor', () => {
   describe('distributeToken', () => {
     it('devrait distribuer un token vers plusieurs wallets', async () => {
       const mockWallets: WalletInfo[] = [
-        { address: '0x1', wallet: {} as any, index: 0, nonce: 0 },
-        { address: '0x2', wallet: {} as any, index: 1, nonce: 0 },
+        { address: '0x1', wallet: {} as any, index: 0, nonce: 0, publicKey: '0x041' },
+        { address: '0x2', wallet: {} as any, index: 1, nonce: 0, publicKey: '0x042' },
       ];
 
       const amounts = [10, 10];
@@ -317,8 +321,8 @@ describe('HubDistributor', () => {
 
     it('devrait gérer les erreurs de distribution', async () => {
       const mockWallets: WalletInfo[] = [
-        { address: '0x1', wallet: {} as any, index: 0, nonce: 0 },
-        { address: '0x2', wallet: {} as any, index: 1, nonce: 0 },
+        { address: '0x1', wallet: {} as any, index: 0, nonce: 0, publicKey: '0x041' },
+        { address: '0x2', wallet: {} as any, index: 1, nonce: 0, publicKey: '0x042' },
       ];
 
       const amounts = [10, 10];

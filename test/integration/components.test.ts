@@ -77,18 +77,20 @@ vi.mock('../../src/core/wallet-manager.js', () => ({
           provider: provider,
           getNonce: vi.fn().mockResolvedValue(0),
           sendTransaction: vi.fn().mockResolvedValue({ hash: `0x${walletCounter}tx`, wait: vi.fn().mockResolvedValue({ status: 1 }) }),
+          publicKey: `0x04${walletCounter.toString().padStart(128, '0')}`,
         };
-        
+
         const walletInfo = {
           address: mockWallet.address,
           wallet: mockWallet,
           index: index,
           nonce: 0,
+          publicKey: mockWallet.publicKey,
         };
-        
-        wallets.set(mockWallet.address, walletInfo);
+
+        wallets.set(mockWallet.address.toLowerCase(), walletInfo);
         walletCounter++;
-        
+
         return walletInfo;
       }),
       getWallets: vi.fn(() => Array.from(wallets.values())),
@@ -103,7 +105,8 @@ vi.mock('../../src/core/wallet-manager.js', () => ({
       }),
       getStats: vi.fn(() => ({
         totalWallets: wallets.size,
-        walletAddresses: Array.from(wallets.keys()),
+        addresses: Array.from(wallets.values()).map((info) => info.address),
+        publicKeys: Array.from(wallets.values()).map((info) => info.publicKey),
         nonceStats: Object.fromEntries(Array.from(wallets.entries()).map(([addr, info]) => [addr, info.nonce])),
       })),
     };
@@ -135,7 +138,8 @@ describe('Integration Tests - Components', () => {
       // Vérifier les statistiques
       const stats = walletManager.getStats();
       expect(stats.totalWallets).toBe(3);
-      expect(stats.walletAddresses).toHaveLength(3);
+      expect(stats.addresses).toHaveLength(3);
+      expect(stats.publicKeys).toHaveLength(3);
     });
 
     it('devrait gérer les nonces correctement', async () => {

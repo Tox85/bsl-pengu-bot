@@ -8,6 +8,12 @@ vi.mock('ethers', async (importOriginal) => {
   const mockWallet = {
     address: '0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
     privateKey: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+    publicKey: '0x04bfcab58fbd8c6f5f5d3b1782e46b408e5f1e7d512975a9f03d3bd6e10c7a8f17e5b6b7bde7f73c62f0bca6ecb3efa1b9bd8e5dcd7f2571c2cb2bfa7b4b5b6c',
+  };
+
+  const mockHdNode = {
+    privateKey: mockWallet.privateKey,
+    publicKey: mockWallet.publicKey,
   };
   
   // Mock du constructeur Wallet
@@ -23,6 +29,9 @@ vi.mock('ethers', async (importOriginal) => {
   return {
     ...actual,
     Wallet: MockWallet,
+    HDNodeWallet: {
+      fromPhrase: vi.fn(() => mockHdNode),
+    },
   };
 });
 
@@ -48,6 +57,7 @@ vi.mock('../src/core/rpc.js', () => ({
 const mockWallet = {
   address: '0x742d35Cc6634C0532925a3b8D1B2b3b4C5D6E7F8',
   privateKey: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+  publicKey: '0x04bfcab58fbd8c6f5f5d3b1782e46b408e5f1e7d512975a9f03d3bd6e10c7a8f17e5b6b7bde7f73c62f0bca6ecb3efa1b9bd8e5dcd7f2571c2cb2bfa7b4b5b6c',
 };
 
 const mockProvider = {
@@ -77,6 +87,7 @@ describe('WalletManager', () => {
       expect(result.address.startsWith('0x')).toBe(true);
       expect(result.index).toBe(0);
       expect(walletManager.hasWallet(result.address)).toBe(true);
+      expect(result.publicKey).toBe(mockWallet.publicKey);
     });
 
     it('devrait créer des wallets avec des index différents', () => {
@@ -107,6 +118,7 @@ describe('WalletManager', () => {
       expect(result.address.startsWith('0x')).toBe(true);
       expect(result.index).toBe(5);
       expect(walletManager.hasWallet(result.address)).toBe(true);
+      expect(result.publicKey).toBe(mockWallet.publicKey);
     });
   });
 
@@ -210,8 +222,9 @@ describe('WalletManager', () => {
       const stats = walletManager.getStats();
 
       expect(stats.totalWallets).toBe(1);
-      expect(stats.walletAddresses).toHaveLength(1);
-      expect(stats.nonceStats).toHaveProperty(walletResult.address);
+      expect(stats.addresses).toHaveLength(1);
+      expect(stats.publicKeys).toHaveLength(1);
+      expect(stats.nonceStats).toHaveProperty(walletResult.address.toLowerCase());
     });
   });
 
@@ -232,6 +245,13 @@ describe('WalletManager', () => {
       const mnemonic = WalletManager.generateMnemonic();
       expect(typeof mnemonic).toBe('string');
       expect(mnemonic.split(' ')).toHaveLength(12);
+    });
+  });
+
+  describe('getPublicKeyFromMnemonic', () => {
+    it('devrait retourner la clé publique pour un index donné', () => {
+      const publicKey = walletManager.getPublicKeyFromMnemonic(testMnemonic, 0);
+      expect(publicKey).toBe(mockWallet.publicKey);
     });
   });
 });
